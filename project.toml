@@ -1,0 +1,23 @@
+[project]
+name    = "minisql"
+version = "0.1.0"
+type    = "application"
+
+[build]
+cflags = ["-I", "include"]
+
+[[module]]
+name    = "MINISQL"
+startup = "crt0"
+sources = ["src/minisql.c"]
+
+[[module]]
+name    = "MSQLTSO"
+startup = "crt0"
+sources = ["src/msqltso.c", "asm/msqtget.asm", "asm/msqtput.asm"]
+
+[deploy]
+target = "IBMUSER.MINISQL.LOAD"
+
+[artifacts]
+loads = true
