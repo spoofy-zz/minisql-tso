@@ -16,7 +16,7 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define MAX_NAME 16
 #define MAX_COLS 16
 #define MAX_VALUE 32
-#define MAX_ROWS 128
+#define MAX_ROWS 256
 #define MAX_TABLES 32
 #define MAX_INDEXES 4
 #define MAX_STATEMENT 2048

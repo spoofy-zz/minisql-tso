@@ -434,7 +434,7 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
   foreign keys, or check constraints.
 - Maximum 32 tables.
 - Maximum 16 columns per table.
-- Maximum 128 rows per table.
+- Maximum 256 rows per table.
 - Maximum 4 secondary indexes per table.
 - `PRIMARY KEY` supports one column only.
 - `CREATE INDEX` supports one column per index.

@@ -8,7 +8,7 @@
          INDEXED -
          KEYS(64 0) -
          RECORDSIZE(1024 1024) -
-         RECORDS(8000 2000) -
+         RECORDS(16000 4000) -
          SHAREOPTIONS(2 3) -
          UNIQUE -
          SPEED VOLUMES(TSO003)) -
