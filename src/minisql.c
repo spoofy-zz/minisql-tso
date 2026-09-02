@@ -24,6 +24,10 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define KV_DATA 192
 #define KV_RECLEN (KV_KEY + KV_DATA)
 #define KV_DD "MINIKV"
+#define TYPE_TEXT 0
+#define TYPE_INT 1
+#define TYPE_CHAR 2
+#define TYPE_VARCHAR 3
 
 struct TableDef {
     char name[MAX_NAME + 1];
@@ -31,6 +35,8 @@ struct TableDef {
     int pk_col;
     int index_count;
     char cols[MAX_COLS][MAX_NAME + 1];
+    int col_types[MAX_COLS];
+    int col_lens[MAX_COLS];
     char index_names[MAX_INDEXES][MAX_NAME + 1];
     int index_cols[MAX_INDEXES];
 };
@@ -47,6 +53,7 @@ struct KvRec {
 static void rtrim(char *s);
 static int parse_where(struct TableDef *t, char *where_text,
                        int *where_col, char *where_val);
+static int validate_value(struct TableDef *t, int col, const char *value);
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
 static char g_tso_out[MAX_LINE];
@@ -504,6 +511,165 @@ static int valid_name(const char *s)
     return (int)strlen(s) <= MAX_NAME;
 }
 
+static int parse_type_name(const char *s, int *type, int *len)
+{
+    char buf[MAX_VALUE + 1];
+    char *open;
+    char *close;
+    int n;
+
+    *type = TYPE_TEXT;
+    *len = MAX_VALUE;
+    strncpy(buf, s, MAX_VALUE);
+    buf[MAX_VALUE] = '\0';
+    clean_token(buf);
+    if (buf[0] == '\0' || eqi(buf, "TEXT")) {
+        return 1;
+    }
+    if (eqi(buf, "INT") || eqi(buf, "INTEGER")) {
+        *type = TYPE_INT;
+        *len = 0;
+        return 1;
+    }
+    if (starts_i(buf, "CHAR(") || starts_i(buf, "VARCHAR(")) {
+        open = strchr(buf, '(');
+        close = strrchr(buf, ')');
+        if (open == NULL || close == NULL || close <= open + 1) {
+            return 0;
+        }
+        *close = '\0';
+        n = atoi(open + 1);
+        if (n < 1 || n > MAX_VALUE) {
+            return 0;
+        }
+        *type = starts_i(buf, "CHAR(") ? TYPE_CHAR : TYPE_VARCHAR;
+        *len = n;
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_column_def(char *text, char *name, int *type, int *len)
+{
+    char buf[MAX_VALUE + 1];
+    char *p;
+    int i = 0;
+
+    strncpy(buf, text, MAX_VALUE);
+    buf[MAX_VALUE] = '\0';
+    clean_token(buf);
+    p = buf;
+    while (*p && !isspace((unsigned char)*p)) {
+        if (i < MAX_NAME) {
+            name[i++] = *p;
+        }
+        p++;
+    }
+    name[i] = '\0';
+    p = ltrim(p);
+    if (!valid_name(name)) {
+        return 0;
+    }
+    return parse_type_name(p, type, len);
+}
+
+static void type_to_text(int type, int len, char *out, int max)
+{
+    if (type == TYPE_INT) {
+        strncpy(out, "INT", max);
+    } else if (type == TYPE_CHAR) {
+        sprintf(out, "CHAR(%d)", len);
+    } else if (type == TYPE_VARCHAR) {
+        sprintf(out, "VARCHAR(%d)", len);
+    } else {
+        strncpy(out, "TEXT", max);
+    }
+    out[max - 1] = '\0';
+}
+
+static void catalog_col_token(struct TableDef *t, int col,
+                              char *out, int max)
+{
+    if (t->col_types[col] == TYPE_INT) {
+        sprintf(out, "%s:I", t->cols[col]);
+    } else if (t->col_types[col] == TYPE_CHAR) {
+        sprintf(out, "%s:C%d", t->cols[col], t->col_lens[col]);
+    } else if (t->col_types[col] == TYPE_VARCHAR) {
+        sprintf(out, "%s:V%d", t->cols[col], t->col_lens[col]);
+    } else {
+        sprintf(out, "%s:T", t->cols[col]);
+    }
+    out[max - 1] = '\0';
+}
+
+static int decode_column_token(struct TableDef *table, int col, char *tok)
+{
+    char *colon;
+
+    table->col_types[col] = TYPE_TEXT;
+    table->col_lens[col] = MAX_VALUE;
+    colon = strchr(tok, ':');
+    if (colon != NULL) {
+        *colon = '\0';
+        colon++;
+        if (eqi(colon, "I")) {
+            table->col_types[col] = TYPE_INT;
+            table->col_lens[col] = 0;
+        } else if (colon[0] == 'C') {
+            table->col_types[col] = TYPE_CHAR;
+            table->col_lens[col] = atoi(colon + 1);
+        } else if (colon[0] == 'V') {
+            table->col_types[col] = TYPE_VARCHAR;
+            table->col_lens[col] = atoi(colon + 1);
+        } else if (!eqi(colon, "T")) {
+            return 0;
+        }
+        if (table->col_types[col] != TYPE_INT &&
+            (table->col_lens[col] < 1 ||
+             table->col_lens[col] > MAX_VALUE)) {
+            return 0;
+        }
+    }
+    strncpy(table->cols[col], tok, MAX_NAME);
+    table->cols[col][MAX_NAME] = '\0';
+    rtrim(table->cols[col]);
+    return valid_name(table->cols[col]);
+}
+
+static int validate_value(struct TableDef *t, int col, const char *value)
+{
+    int i;
+    int start = 0;
+    int len = (int)strlen(value);
+
+    if (len > MAX_VALUE) {
+        printf("ERR VALUE TOO LONG\n");
+        return 0;
+    }
+    if (t->col_types[col] == TYPE_INT) {
+        if (value[0] == '-' || value[0] == '+') {
+            start = 1;
+        }
+        if (value[start] == '\0') {
+            printf("ERR BAD INT VALUE\n");
+            return 0;
+        }
+        for (i = start; value[i] != '\0'; i++) {
+            if (!isdigit((unsigned char)value[i])) {
+                printf("ERR BAD INT VALUE\n");
+                return 0;
+            }
+        }
+    } else if (t->col_types[col] == TYPE_CHAR ||
+               t->col_types[col] == TYPE_VARCHAR) {
+        if (len > t->col_lens[col]) {
+            printf("ERR VALUE TOO LONG\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int parse_csv(char *text, char values[MAX_COLS][MAX_VALUE + 1],
                      int *count)
 {
@@ -605,9 +771,9 @@ static int decode_table_def(struct TableDef *table, const char *data)
         if (c >= MAX_COLS) {
             return 0;
         }
-        strncpy(table->cols[c], tok, MAX_NAME);
-        table->cols[c][MAX_NAME] = '\0';
-        rtrim(table->cols[c]);
+        if (!decode_column_token(table, c, tok)) {
+            return 0;
+        }
         c++;
     }
     table->col_count = c;
@@ -704,12 +870,14 @@ static int save_catalog(struct TableDef tables[], int count)
             strcat(data, tables[i].cols[tables[i].pk_col]);
         }
         for (c = 0; c < tables[i].col_count; c++) {
-            if ((int)strlen(data) + 1 + (int)strlen(tables[i].cols[c]) >
-                KV_DATA) {
+            char coltok[MAX_VALUE + 1];
+
+            catalog_col_token(&tables[i], c, coltok, sizeof(coltok));
+            if ((int)strlen(data) + 1 + (int)strlen(coltok) > KV_DATA) {
                 return 0;
             }
             strcat(data, "|");
-            strcat(data, tables[i].cols[c]);
+            strcat(data, coltok);
         }
         for (c = 0; c < tables[i].index_count; c++) {
             if ((int)strlen(data) + 5 +
@@ -988,6 +1156,25 @@ static int where_match(struct Row *row, int where_col, const char *where_val)
     return eqi(row->values[where_col], where_val);
 }
 
+static void print_select_line(struct TableDef *t, struct Row *row, int header)
+{
+    char line[MAX_LINE];
+    int c;
+
+    line[0] = '\0';
+    for (c = 0; c < t->col_count; c++) {
+        if (c > 0) {
+            strcat(line, " | ");
+        }
+        if (header) {
+            strcat(line, t->cols[c]);
+        } else {
+            strcat(line, row->values[c]);
+        }
+    }
+    printf("%s\n", line);
+}
+
 static void cmd_tables(struct TableDef tables[], int count)
 {
     int i;
@@ -1017,10 +1204,14 @@ static void cmd_schema(struct TableDef tables[], int count, char *sql)
     }
     printf("%s(", tables[idx].name);
     for (c = 0; c < tables[idx].col_count; c++) {
+        char typ[MAX_VALUE + 1];
+
         if (c > 0) {
             printf(", ");
         }
-        printf("%s", tables[idx].cols[c]);
+        type_to_text(tables[idx].col_types[c], tables[idx].col_lens[c],
+                     typ, sizeof(typ));
+        printf("%s %s", tables[idx].cols[c], typ);
         if (tables[idx].pk_col == c) {
             printf(" PRIMARY KEY");
         }
@@ -1081,6 +1272,9 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
     pk_name[0] = '\0';
     for (i = 0; i < col_count; i++) {
         char *pk;
+        char col_name[MAX_NAME + 1];
+        int col_type;
+        int col_len;
 
         if (starts_i(vals[i], "PRIMARY KEY")) {
             char *open = strchr(vals[i], '(');
@@ -1099,17 +1293,24 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
 
         pk = find_i(vals[i], "PRIMARY KEY");
         if (pk != NULL) {
+            char tmp_name[MAX_NAME + 1];
+            int tmp_type;
+            int tmp_len;
+
             if (pk_name[0] != '\0') {
                 printf("ERR BAD PRIMARY KEY\n");
                 return;
             }
             *pk = '\0';
-            clean_token(vals[i]);
-            strncpy(pk_name, vals[i], MAX_NAME);
+            if (!parse_column_def(vals[i], tmp_name, &tmp_type, &tmp_len)) {
+                printf("ERR BAD PRIMARY KEY\n");
+                return;
+            }
+            strncpy(pk_name, tmp_name, MAX_NAME);
             pk_name[MAX_NAME] = '\0';
         }
 
-        if (!valid_name(vals[i])) {
+        if (!parse_column_def(vals[i], col_name, &col_type, &col_len)) {
             printf("ERR BAD COLUMN NAME\n");
             return;
         }
@@ -1117,8 +1318,10 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
             printf("ERR TOO MANY COLUMNS\n");
             return;
         }
-        strncpy(tables[*count].cols[actual_cols], vals[i], MAX_NAME);
+        strncpy(tables[*count].cols[actual_cols], col_name, MAX_NAME);
         tables[*count].cols[actual_cols][MAX_NAME] = '\0';
+        tables[*count].col_types[actual_cols] = col_type;
+        tables[*count].col_lens[actual_cols] = col_len;
         if (pk_name[0] != '\0' &&
             eqi(tables[*count].cols[actual_cols], pk_name)) {
             pk_col = actual_cols;
@@ -1289,6 +1492,11 @@ static void cmd_insert(struct TableDef tables[], int count, char *sql)
         printf("ERR VALUE COUNT\n");
         return;
     }
+    for (i = 0; i < val_count; i++) {
+        if (!validate_value(&tables[idx], i, vals[i])) {
+            return;
+        }
+    }
     if (!load_rows(&tables[idx], rows, &row_count)) {
         printf("ERR CANNOT READ TABLE\n");
         return;
@@ -1358,13 +1566,11 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         printf("ERR BAD WHERE\n");
         return;
     }
-    for (c = 0; c < tables[idx].col_count; c++) {
-        if (c > 0) {
-            printf(" | ");
-        }
-        printf("%s", tables[idx].cols[c]);
+    if (where_col >= 0 &&
+        !validate_value(&tables[idx], where_col, where_val)) {
+        return;
     }
-    printf("\n");
+    print_select_line(&tables[idx], NULL, 1);
 
     index_no = find_index_col(&tables[idx], where_col);
     if (where_col >= 0 && index_no >= 0) {
@@ -1386,13 +1592,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
             if (!found || !where_match(&row, where_col, where_val)) {
                 continue;
             }
-            for (c = 0; c < tables[idx].col_count; c++) {
-                if (c > 0) {
-                    printf(" | ");
-                }
-                printf("%s", row.values[c]);
-            }
-            printf("\n");
+            print_select_line(&tables[idx], &row, 0);
             out_count++;
         }
         printf("OK %d ROWS\n", out_count);
@@ -1407,13 +1607,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         if (!where_match(&rows[r], where_col, where_val)) {
             continue;
         }
-        for (c = 0; c < tables[idx].col_count; c++) {
-            if (c > 0) {
-                printf(" | ");
-            }
-            printf("%s", rows[r].values[c]);
-        }
-        printf("\n");
+        print_select_line(&tables[idx], &rows[r], 0);
         out_count++;
     }
     printf("OK %d ROWS\n", out_count);
@@ -1482,6 +1676,10 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
     where = find_i(p, "WHERE");
     if (!parse_where(&tables[idx], where, &where_col, where_val)) {
         printf("ERR BAD WHERE\n");
+        return;
+    }
+    if (where_col >= 0 &&
+        !validate_value(&tables[idx], where_col, where_val)) {
         return;
     }
     if (!load_rows(&tables[idx], rows, &row_count)) {
@@ -1568,8 +1766,15 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
         printf("ERR CANNOT UPDATE PRIMARY KEY\n");
         return;
     }
+    if (!validate_value(&tables[idx], set_col, set_val)) {
+        return;
+    }
     if (!parse_where(&tables[idx], where, &where_col, where_val)) {
         printf("ERR BAD WHERE\n");
+        return;
+    }
+    if (where_col >= 0 &&
+        !validate_value(&tables[idx], where_col, where_val)) {
         return;
     }
     if (!load_rows(&tables[idx], rows, &row_count)) {
@@ -1637,6 +1842,8 @@ static void cmd_help(void)
 {
     printf("COMMANDS:\n");
     printf("  CREATE TABLE name (col1, col2, ...);\n");
+    printf("  TYPES: INT, INTEGER, CHAR(n), VARCHAR(n), TEXT\n");
+    printf("  CREATE TABLE name (id INT PRIMARY KEY, name VARCHAR(16));\n");
     printf("  CREATE TABLE name (id PRIMARY KEY, col2, ...);\n");
     printf("  CREATE TABLE name (id, col2, PRIMARY KEY (id));\n");
     printf("  CREATE INDEX idx ON name (col);\n");

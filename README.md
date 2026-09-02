@@ -12,7 +12,7 @@ razlicitim VSAM bazama ako se u JCL-u promijeni `MINIKV DD`.
 Projekt podrzava osnovni SQL tok za male tablice:
 
 ```sql
-CREATE TABLE LJUDI (ID PRIMARY KEY, IME, GRAD);
+CREATE TABLE LJUDI (ID INT PRIMARY KEY, IME VARCHAR(8), GRAD CHAR(8));
 INSERT INTO LJUDI VALUES (1, 'ANA', 'ZAGREB');
 SELECT * FROM LJUDI;
 CREATE INDEX IDXGRAD ON LJUDI (GRAD);
@@ -37,6 +37,8 @@ Datoteke:
 - `src/msqltso.c` - TSO build wrapper za isti SQL engine.
 - `asm/msqtget.asm` - C-callable TSO `TGET` wrapper za interaktivni input.
 - `asm/msqtput.asm` - C-callable TSO `TPUT` wrapper za normalan TSO output.
+- `clist/MSQL.clist` - TSO CLIST koji alocira `MINIKV`, pokrece
+  `MSQLTSO` i oslobadja DD nakon izlaza.
 - `Makefile` - ukljucuje lokalni `mbt/mk/mbt.mk`.
 - `project.toml` - MBT projekt, modul `MINISQL`, deploy target
   `IBMUSER.MINISQL.LOAD`.
@@ -124,6 +126,14 @@ Lista membera u PDS-u:
 zowe zos-files list all-members IBMUSER.MINISQL --zosmf-profile hercules
 ```
 
+CLIST za jednostavno TSO pokretanje uploadan je u `SYS2.CMDPROC(MSQL)`:
+
+```bash
+zowe zos-files upload file-to-data-set clist/MSQL.clist \
+  "SYS2.CMDPROC(MSQL)" \
+  --zosmf-profile hercules
+```
+
 ## Deploy load modula
 
 Nakon `make deploy ARGS=--dry-run VERBOSE=1`, upload XMIT paketa u staging
@@ -186,7 +196,7 @@ Program se pokrece kao batch program:
 //SYSOUT   DD SYSOUT=*
 //SYSPRINT DD SYSOUT=*
 //SYSIN    DD *
-CREATE TABLE LJUDI (ID PRIMARY KEY, IME, GRAD);
+CREATE TABLE LJUDI (ID INT PRIMARY KEY, IME VARCHAR(8), GRAD CHAR(8));
 INSERT INTO LJUDI VALUES (1, 'ANA', 'ZAGREB');
 CREATE INDEX IDXGRAD ON LJUDI (GRAD);
 SELECT * FROM LJUDI;
@@ -212,6 +222,7 @@ Standardni batch test je `jcl/MINISQL.jcl`. Taj job:
 
 - kreira tablicu `LJUDI` s `ID PRIMARY KEY`
 - ubacuje dva retka
+- testira `INT` validaciju i `VARCHAR` duzinu
 - kreira sekundarni indeks `IDXGRAD` na koloni `GRAD`
 - prikazuje `.SCHEMA LJUDI`
 - testira `SELECT * FROM LJUDI`
@@ -275,7 +286,9 @@ Ocekivani bitni dijelovi outputa:
 
 ```text
 OK TABLE CREATED
-LJUDI(ID PRIMARY KEY, IME, GRAD)
+LJUDI(ID INT PRIMARY KEY, IME VARCHAR(8), GRAD CHAR(8))
+ERR BAD INT VALUE
+ERR VALUE TOO LONG
 OK INDEX CREATED
 INDEX IDXGRAD ON LJUDI(GRAD)
 ID | IME | GRAD
@@ -285,20 +298,23 @@ OK 1 ROWS
 
 ## Testiranje u TSO-u
 
-Interaktivni processor je load modul `MSQLTSO`. On koristi isti SQL engine kao
-batch `MINISQL`, ali ulaz cita preko TSO `TGET`, a output ispisuje preko TSO
-`TPUT`.
+Interaktivni processor je load modul `MSQLTSO`. Najjednostavnije se pokrece
+preko CLIST-a `SYS2.CMDPROC(MSQL)`, koji sam alocira VSAM DD `MINIKV`,
+pozove load modul i na izlazu napravi `FREE FI(MINIKV)`.
 
-U foreground TSO sesiji prvo alociraj VSAM bazu:
+U foreground TSO sesiji pokreni:
+
+```text
+MSQL
+```
+
+Ako CLIST nije u tvojem `SYSPROC`/`SYSEXEC` search pathu, pokreni ga kao TSO
+komandu iz odgovarajuceg command procedure libraryja ili rucno napravi:
 
 ```text
 ALLOC FI(MINIKV) DA('IBMUSER.MINISQL.KV') OLD
-```
-
-Zatim pokreni processor:
-
-```text
 CALL 'IBMUSER.MINISQL.LOAD(MSQLTSO)'
+FREE FI(MINIKV)
 ```
 
 Primjer interaktivnog testa:
@@ -309,6 +325,8 @@ Primjer interaktivnog testa:
 SELECT * FROM LJUDI;
 SELECT * FROM LJUDI WHERE GRAD='RIJEKA';
 INSERT INTO LJUDI VALUES (3, 'PERO', 'RIJEKA');
+INSERT INTO LJUDI VALUES ('ABC', 'PERO', 'RIJEKA');
+INSERT INTO LJUDI VALUES (4, 'PREDUGOIME', 'RIJEKA');
 SELECT * FROM LJUDI WHERE GRAD='RIJEKA';
 UPDATE LJUDI SET GRAD='SISAK' WHERE ID=3;
 SELECT * FROM LJUDI WHERE GRAD='RIJEKA';
@@ -322,6 +340,8 @@ Ocekivano ponasanje:
 
 - `.SCHEMA LJUDI` prikazuje `ID PRIMARY KEY` i `INDEX IDXGRAD ON LJUDI(GRAD)`
 - `SELECT ... WHERE GRAD='RIJEKA'` koristi sekundarni indeks ako postoji
+- `ID` prima samo cijeli broj jer je `INT`
+- `IME` prima najvise 8 znakova jer je `VARCHAR(8)`
 - dupli `ID=3` vraca `ERR DUPLICATE PRIMARY KEY`
 - promjena primary key kolone vraca `ERR CANNOT UPDATE PRIMARY KEY`
 - promjena ne-key kolone, npr. `GRAD`, radi i automatski obnavlja indeks
@@ -392,8 +412,14 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 
 ## Ogranicenja
 
-- Svi podaci su tekstualne vrijednosti. Nema SQL tipova kao `INTEGER`,
-  `DATE`, `DECIMAL`, `CHAR(n)` ili `VARCHAR(n)`.
+- Podrzani SQL tipovi su `INT`/`INTEGER`, `CHAR(n)`, `VARCHAR(n)` i `TEXT`.
+- Tipovi su validacijski metadata. Vrijednosti se i dalje spremaju kao tekst
+  u VSAM row payloadu.
+- `INT` podrzava opcionalni `+`/`-` i decimalne znamenke, ali nema aritmetike
+  ni numeric sort/compare operacija.
+- `CHAR(n)` i `VARCHAR(n)` provjeravaju maksimalnu duzinu. `CHAR(n)` se ne
+  pad-a razmacima na fiksnu duzinu.
+- Nema SQL tipova `DATE`, `TIME`, `DECIMAL`, `FLOAT`, `BOOLEAN` ili `BLOB`.
 - Vrijednosti se ciste i spremaju uppercase; navodnici se koriste samo za
   parsiranje vrijednosti s razmacima ili jasniji SQL izgled.
 - Nema `NULL`, default vrijednosti, constrainta osim jednog primary keya,
