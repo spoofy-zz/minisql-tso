@@ -18,16 +18,21 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define MAX_VALUE 32
 #define MAX_ROWS 32
 #define MAX_TABLES 32
+#define MAX_INDEXES 4
 #define MAX_STATEMENT 2048
-#define KV_KEY 32
-#define KV_DATA 48
+#define KV_KEY 64
+#define KV_DATA 192
 #define KV_RECLEN (KV_KEY + KV_DATA)
 #define KV_DD "MINIKV"
 
 struct TableDef {
     char name[MAX_NAME + 1];
     int col_count;
+    int pk_col;
+    int index_count;
     char cols[MAX_COLS][MAX_NAME + 1];
+    char index_names[MAX_INDEXES][MAX_NAME + 1];
+    int index_cols[MAX_INDEXES];
 };
 
 struct Row {
@@ -40,6 +45,8 @@ struct KvRec {
 };
 
 static void rtrim(char *s);
+static int parse_where(struct TableDef *t, char *where_text,
+                       int *where_col, char *where_val);
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
 static char g_tso_out[MAX_LINE];
@@ -109,6 +116,16 @@ static void kv_make_key(char *out, const char *kind, const char *name, int seq)
     } else {
         sprintf(tmp, "%s|%-16.16s", kind, name);
     }
+    memcpy(out, tmp, strlen(tmp));
+}
+
+static void kv_make_index_key(char *out, const char *table,
+                              const char *idx, int seq)
+{
+    char tmp[KV_KEY + 1];
+
+    memset(out, ' ', KV_KEY);
+    sprintf(tmp, "X|%-16.16s|%-16.16s|%06d", table, idx, seq);
     memcpy(out, tmp, strlen(tmp));
 }
 
@@ -276,24 +293,40 @@ static int kv_scan(const char *prefix, int prefix_len,
 {
 #ifdef __MVS__
     struct KvRec rec;
+    char last_key[KV_KEY];
     int rc;
+    int have_last = 0;
     if (!kv_open()) {
         return 0;
     }
     memset(&rec, ' ', sizeof(rec));
-    if (__vsstge(g_kv, &rec, sizeof(rec), (void *)prefix, KV_KEY) != 0) {
+    if (__vsstge(g_kv, &rec, sizeof(rec), (void *)prefix, prefix_len) != 0) {
         __vsclr(g_kv);
         return 1;
+    }
+    if (key_has_prefix(rec.key, prefix, prefix_len)) {
+        char data[KV_DATA + 1];
+        data_get(data, rec.data, sizeof(data));
+        if (!cb(rec.key, data, arg)) {
+            return 1;
+        }
+        memcpy(last_key, rec.key, KV_KEY);
+        have_last = 1;
     }
     while ((rc = __vsread(g_kv, &rec, sizeof(rec), NULL, 0)) >= 0) {
         char data[KV_DATA + 1];
         if (!key_has_prefix(rec.key, prefix, prefix_len)) {
             break;
         }
+        if (have_last && memcmp(last_key, rec.key, KV_KEY) == 0) {
+            continue;
+        }
         data_get(data, rec.data, sizeof(data));
         if (!cb(rec.key, data, arg)) {
             break;
         }
+        memcpy(last_key, rec.key, KV_KEY);
+        have_last = 1;
     }
     return rc == -2 ? 0 : 1;
 #else
@@ -379,6 +412,7 @@ static int line_starts_command(const char *s)
            starts_i(s, ".TABLES") ||
            starts_i(s, ".SCHEMA") ||
            starts_i(s, "CREATE TABLE") ||
+           starts_i(s, "CREATE INDEX") ||
            starts_i(s, "INSERT INTO") ||
            starts_i(s, "SELECT") ||
            starts_i(s, "UPDATE") ||
@@ -510,52 +544,131 @@ struct CatalogScan {
     int ok;
 };
 
+static int decode_table_def(struct TableDef *table, const char *data)
+{
+    char buf[KV_DATA + 1];
+    char pk_name[MAX_NAME + 1];
+    char *tok;
+    int c = 0;
+    int i;
+
+    strncpy(buf, data, KV_DATA);
+    buf[KV_DATA] = '\0';
+    tok = strtok(buf, "|");
+    if (tok == NULL) {
+        return 0;
+    }
+    strncpy(table->name, tok, MAX_NAME);
+    table->name[MAX_NAME] = '\0';
+    table->pk_col = -1;
+    table->index_count = 0;
+    pk_name[0] = '\0';
+    while ((tok = strtok(NULL, "|")) != NULL) {
+        if (starts_i(tok, "PK=")) {
+            strncpy(pk_name, tok + 3, MAX_NAME);
+            pk_name[MAX_NAME] = '\0';
+            rtrim(pk_name);
+            continue;
+        }
+        if (starts_i(tok, "IX=")) {
+            char idxbuf[MAX_VALUE + 1];
+            char *colon;
+            int ixcol;
+
+            strncpy(idxbuf, tok + 3, MAX_VALUE);
+            idxbuf[MAX_VALUE] = '\0';
+            rtrim(idxbuf);
+            colon = strchr(idxbuf, ':');
+            if (colon == NULL || table->index_count >= MAX_INDEXES) {
+                return 0;
+            }
+            *colon = '\0';
+            clean_token(idxbuf);
+            clean_token(colon + 1);
+            ixcol = -1;
+            for (i = 0; i < c; i++) {
+                if (eqi(table->cols[i], colon + 1)) {
+                    ixcol = i;
+                    break;
+                }
+            }
+            if (ixcol < 0) {
+                return 0;
+            }
+            strncpy(table->index_names[table->index_count], idxbuf,
+                    MAX_NAME);
+            table->index_names[table->index_count][MAX_NAME] = '\0';
+            table->index_cols[table->index_count] = ixcol;
+            table->index_count++;
+            continue;
+        }
+        if (c >= MAX_COLS) {
+            return 0;
+        }
+        strncpy(table->cols[c], tok, MAX_NAME);
+        table->cols[c][MAX_NAME] = '\0';
+        rtrim(table->cols[c]);
+        c++;
+    }
+    table->col_count = c;
+    if (pk_name[0] != '\0') {
+        for (i = 0; i < c; i++) {
+            if (eqi(table->cols[i], pk_name)) {
+                table->pk_col = i;
+                break;
+            }
+        }
+    }
+    return c > 0;
+}
+
 static int catalog_cb(const char *key, const char *data, void *arg)
 {
     struct CatalogScan *scan = (struct CatalogScan *)arg;
-    char buf[KV_DATA + 1];
-    char *tok;
-    int c = 0;
 
     (void)key;
     if (scan->count >= MAX_TABLES) {
         scan->ok = 0;
         return 0;
     }
-    strncpy(buf, data, KV_DATA);
-    buf[KV_DATA] = '\0';
-    tok = strtok(buf, "|");
-    if (tok == NULL) {
-        return 1;
+    if (!decode_table_def(&scan->tables[scan->count], data)) {
+        scan->ok = 0;
+        return 0;
     }
-    strncpy(scan->tables[scan->count].name, tok, MAX_NAME);
-    scan->tables[scan->count].name[MAX_NAME] = '\0';
-    while ((tok = strtok(NULL, "|")) != NULL && c < MAX_COLS) {
-        strncpy(scan->tables[scan->count].cols[c], tok, MAX_NAME);
-        scan->tables[scan->count].cols[c][MAX_NAME] = '\0';
-        rtrim(scan->tables[scan->count].cols[c]);
-        c++;
-    }
-    scan->tables[scan->count].col_count = c;
     scan->count++;
     return 1;
 }
 
 static int load_catalog(struct TableDef tables[], int *count)
 {
-    char prefix[KV_KEY];
-    int prefix_len;
-    struct CatalogScan scan;
+    int i;
+    int out = 0;
 
-    kv_make_prefix(prefix, "T", "", &prefix_len);
-    scan.tables = tables;
-    scan.count = 0;
-    scan.ok = 1;
-    if (!kv_scan(prefix, prefix_len, catalog_cb, &scan)) {
-        return 0;
+    for (i = 1; i <= MAX_TABLES; i++) {
+        char slot_key[KV_KEY];
+        char table_key[KV_KEY];
+        char name[MAX_NAME + 1];
+        char data[KV_DATA + 1];
+
+        kv_make_key(slot_key, "C", "", i);
+        if (!kv_get(slot_key, name, sizeof(name))) {
+            continue;
+        }
+        clean_token(name);
+        if (!valid_name(name)) {
+            return 0;
+        }
+        kv_make_key(table_key, "T", name, -1);
+        if (!kv_get(table_key, data, sizeof(data))) {
+            return 0;
+        }
+        if (!decode_table_def(&tables[out], data)) {
+            return 0;
+        }
+        out++;
     }
-    *count = scan.count;
-    return scan.ok;
+    *count = out;
+    return 1;
 }
 
 static int save_catalog(struct TableDef tables[], int count)
@@ -563,9 +676,9 @@ static int save_catalog(struct TableDef tables[], int count)
     int i;
     int c;
 
-    for (i = 0; i < count; i++) {
+    for (i = 1; i <= MAX_TABLES; i++) {
         char key[KV_KEY];
-        kv_make_key(key, "T", tables[i].name, -1);
+        kv_make_key(key, "C", "", i);
         if (!kv_delete(key)) {
             return 0;
         }
@@ -573,7 +686,23 @@ static int save_catalog(struct TableDef tables[], int count)
     for (i = 0; i < count; i++) {
         char key[KV_KEY];
         char data[KV_DATA + 1];
+        kv_make_key(key, "C", "", i + 1);
+        if (!kv_put(key, tables[i].name)) {
+            return 0;
+        }
+        kv_make_key(key, "T", tables[i].name, -1);
+        if (!kv_delete(key)) {
+            return 0;
+        }
         strcpy(data, tables[i].name);
+        if (tables[i].pk_col >= 0) {
+            if ((int)strlen(data) + 4 +
+                (int)strlen(tables[i].cols[tables[i].pk_col]) > KV_DATA) {
+                return 0;
+            }
+            strcat(data, "|PK=");
+            strcat(data, tables[i].cols[tables[i].pk_col]);
+        }
         for (c = 0; c < tables[i].col_count; c++) {
             if ((int)strlen(data) + 1 + (int)strlen(tables[i].cols[c]) >
                 KV_DATA) {
@@ -582,12 +711,44 @@ static int save_catalog(struct TableDef tables[], int count)
             strcat(data, "|");
             strcat(data, tables[i].cols[c]);
         }
-        kv_make_key(key, "T", tables[i].name, -1);
+        for (c = 0; c < tables[i].index_count; c++) {
+            if ((int)strlen(data) + 5 +
+                (int)strlen(tables[i].index_names[c]) +
+                (int)strlen(tables[i].cols[tables[i].index_cols[c]]) >
+                KV_DATA) {
+                return 0;
+            }
+            strcat(data, "|IX=");
+            strcat(data, tables[i].index_names[c]);
+            strcat(data, ":");
+            strcat(data, tables[i].cols[tables[i].index_cols[c]]);
+        }
         if (!kv_put(key, data)) {
             return 0;
         }
     }
+    kv_close();
     return 1;
+}
+
+static int find_pk_duplicate(struct TableDef *t, struct Row rows[],
+                             int row_count, const char *value,
+                             int skip_row)
+{
+    int r;
+
+    if (t->pk_col < 0) {
+        return -1;
+    }
+    for (r = 0; r < row_count; r++) {
+        if (r == skip_row) {
+            continue;
+        }
+        if (eqi(rows[r].values[t->pk_col], value)) {
+            return r;
+        }
+    }
+    return -1;
 }
 
 static int find_table(struct TableDef tables[], int count, const char *name)
@@ -606,6 +767,28 @@ static int find_col(struct TableDef *t, const char *name)
     int i;
     for (i = 0; i < t->col_count; i++) {
         if (eqi(t->cols[i], name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int find_index_name(struct TableDef *t, const char *name)
+{
+    int i;
+    for (i = 0; i < t->index_count; i++) {
+        if (eqi(t->index_names[i], name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int find_index_col(struct TableDef *t, int col)
+{
+    int i;
+    for (i = 0; i < t->index_count; i++) {
+        if (t->index_cols[i] == col) {
             return i;
         }
     }
@@ -663,20 +846,97 @@ static int row_cb(const char *key, const char *data, void *arg)
 
 static int load_rows(struct TableDef *t, struct Row rows[], int *row_count)
 {
-    char prefix[KV_KEY];
-    int prefix_len;
-    struct RowScan scan;
+    int r;
+    int c;
+    int out = 0;
 
-    kv_make_prefix(prefix, "R", t->name, &prefix_len);
-    scan.table = t;
-    scan.rows = rows;
-    scan.count = 0;
-    scan.ok = 1;
-    if (!kv_scan(prefix, prefix_len, row_cb, &scan)) {
+    for (r = 1; r <= MAX_ROWS; r++) {
+        char key[KV_KEY];
+        char data[KV_DATA + 1];
+        char vals[MAX_COLS][MAX_VALUE + 1];
+        int cnt = 0;
+
+        kv_make_key(key, "R", t->name, r);
+        if (!kv_get(key, data, sizeof(data))) {
+            continue;
+        }
+        if (out >= MAX_ROWS) {
+            return 0;
+        }
+        if (!parse_csv(data, vals, &cnt) || cnt != t->col_count) {
+            return 0;
+        }
+        for (c = 0; c < cnt; c++) {
+            strncpy(rows[out].values[c], vals[c], MAX_VALUE);
+            rows[out].values[c][MAX_VALUE] = '\0';
+        }
+        out++;
+    }
+    *row_count = out;
+    return 1;
+}
+
+static int load_row_slot(struct TableDef *t, int slot, struct Row *row,
+                         int *found)
+{
+    char key[KV_KEY];
+    char data[KV_DATA + 1];
+    char vals[MAX_COLS][MAX_VALUE + 1];
+    int cnt = 0;
+    int c;
+
+    *found = 0;
+    kv_make_key(key, "R", t->name, slot);
+    if (!kv_get(key, data, sizeof(data))) {
+        return 1;
+    }
+    if (!parse_csv(data, vals, &cnt) || cnt != t->col_count) {
         return 0;
     }
-    *row_count = scan.count;
-    return scan.ok;
+    for (c = 0; c < cnt; c++) {
+        strncpy(row->values[c], vals[c], MAX_VALUE);
+        row->values[c][MAX_VALUE] = '\0';
+    }
+    *found = 1;
+    return 1;
+}
+
+static int delete_index_rows(struct TableDef *t)
+{
+    int i;
+    int r;
+
+    for (i = 0; i < t->index_count; i++) {
+        for (r = 1; r <= MAX_ROWS; r++) {
+            char key[KV_KEY];
+            kv_make_index_key(key, t->name, t->index_names[i], r);
+            if (!kv_delete(key)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int rebuild_indexes(struct TableDef *t, struct Row rows[],
+                           int row_count)
+{
+    int i;
+    int r;
+
+    if (!delete_index_rows(t)) {
+        return 0;
+    }
+    for (i = 0; i < t->index_count; i++) {
+        for (r = 0; r < row_count; r++) {
+            char key[KV_KEY];
+            kv_make_index_key(key, t->name, t->index_names[i], r + 1);
+            if (!kv_put(key, rows[r].values[t->index_cols[i]])) {
+                return 0;
+            }
+        }
+    }
+    return 1;
 }
 
 static int save_rows(struct TableDef *t, struct Row rows[], int row_count)
@@ -713,6 +973,10 @@ static int save_rows(struct TableDef *t, struct Row rows[], int row_count)
             return 0;
         }
     }
+    if (!rebuild_indexes(t, rows, row_count)) {
+        return 0;
+    }
+    kv_close();
     return 1;
 }
 
@@ -757,8 +1021,15 @@ static void cmd_schema(struct TableDef tables[], int count, char *sql)
             printf(", ");
         }
         printf("%s", tables[idx].cols[c]);
+        if (tables[idx].pk_col == c) {
+            printf(" PRIMARY KEY");
+        }
     }
     printf(")\n");
+    for (c = 0; c < tables[idx].index_count; c++) {
+        printf("INDEX %s ON %s(%s)\n", tables[idx].index_names[c],
+               tables[idx].name, tables[idx].cols[tables[idx].index_cols[c]]);
+    }
 }
 
 static void cmd_create(struct TableDef tables[], int *count, char *sql)
@@ -767,7 +1038,10 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
     char *q;
     char name[MAX_NAME + 1];
     char vals[MAX_COLS][MAX_VALUE + 1];
+    char pk_name[MAX_NAME + 1];
     int col_count = 0;
+    int actual_cols = 0;
+    int pk_col = -1;
     int i;
 
     p = sql + strlen("CREATE TABLE");
@@ -803,23 +1077,172 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
         printf("ERR TOO MANY TABLES\n");
         return;
     }
-    strncpy(tables[*count].name, name, MAX_NAME);
-    tables[*count].name[MAX_NAME] = '\0';
-    tables[*count].col_count = col_count;
+
+    pk_name[0] = '\0';
     for (i = 0; i < col_count; i++) {
+        char *pk;
+
+        if (starts_i(vals[i], "PRIMARY KEY")) {
+            char *open = strchr(vals[i], '(');
+            char *close = strrchr(vals[i], ')');
+            if (open == NULL || close == NULL || close <= open + 1 ||
+                pk_name[0] != '\0') {
+                printf("ERR BAD PRIMARY KEY\n");
+                return;
+            }
+            *close = '\0';
+            strncpy(pk_name, open + 1, MAX_NAME);
+            pk_name[MAX_NAME] = '\0';
+            clean_token(pk_name);
+            continue;
+        }
+
+        pk = find_i(vals[i], "PRIMARY KEY");
+        if (pk != NULL) {
+            if (pk_name[0] != '\0') {
+                printf("ERR BAD PRIMARY KEY\n");
+                return;
+            }
+            *pk = '\0';
+            clean_token(vals[i]);
+            strncpy(pk_name, vals[i], MAX_NAME);
+            pk_name[MAX_NAME] = '\0';
+        }
+
         if (!valid_name(vals[i])) {
             printf("ERR BAD COLUMN NAME\n");
             return;
         }
-        strncpy(tables[*count].cols[i], vals[i], MAX_NAME);
-        tables[*count].cols[i][MAX_NAME] = '\0';
+        if (actual_cols >= MAX_COLS) {
+            printf("ERR TOO MANY COLUMNS\n");
+            return;
+        }
+        strncpy(tables[*count].cols[actual_cols], vals[i], MAX_NAME);
+        tables[*count].cols[actual_cols][MAX_NAME] = '\0';
+        if (pk_name[0] != '\0' &&
+            eqi(tables[*count].cols[actual_cols], pk_name)) {
+            pk_col = actual_cols;
+        }
+        actual_cols++;
     }
+    if (pk_name[0] != '\0' && pk_col < 0) {
+        for (i = 0; i < actual_cols; i++) {
+            if (eqi(tables[*count].cols[i], pk_name)) {
+                pk_col = i;
+                break;
+            }
+        }
+    }
+    if (actual_cols < 1) {
+        printf("ERR BAD COLUMN LIST\n");
+        return;
+    }
+    if (pk_name[0] != '\0' && pk_col < 0) {
+        printf("ERR BAD PRIMARY KEY\n");
+        return;
+    }
+
+    strncpy(tables[*count].name, name, MAX_NAME);
+    tables[*count].name[MAX_NAME] = '\0';
+    tables[*count].col_count = actual_cols;
+    tables[*count].pk_col = pk_col;
+    tables[*count].index_count = 0;
     (*count)++;
     if (!save_catalog(tables, *count)) {
         printf("ERR CANNOT WRITE CATALOG\n");
         return;
     }
     printf("OK TABLE CREATED\n");
+}
+
+static void cmd_create_index(struct TableDef tables[], int count, char *sql)
+{
+    char idx_name[MAX_NAME + 1];
+    char table_name[MAX_NAME + 1];
+    char col_name[MAX_NAME + 1];
+    char *p;
+    char *onp;
+    char *open;
+    char *close;
+    int i = 0;
+    int tidx;
+    int cidx;
+    int row_count = 0;
+    struct Row rows[MAX_ROWS];
+
+    p = sql + strlen("CREATE INDEX");
+    p = ltrim(p);
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            idx_name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    idx_name[i] = '\0';
+    if (!valid_name(idx_name)) {
+        printf("ERR BAD INDEX NAME\n");
+        return;
+    }
+    onp = find_i(p, "ON");
+    if (onp == NULL) {
+        printf("ERR USAGE: CREATE INDEX name ON table (col)\n");
+        return;
+    }
+    p = ltrim(onp + strlen("ON"));
+    i = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            table_name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    table_name[i] = '\0';
+    tidx = find_table(tables, count, table_name);
+    if (tidx < 0) {
+        printf("ERR TABLE NOT FOUND\n");
+        return;
+    }
+    if (tables[tidx].index_count >= MAX_INDEXES) {
+        printf("ERR TOO MANY INDEXES\n");
+        return;
+    }
+    if (find_index_name(&tables[tidx], idx_name) >= 0) {
+        printf("ERR INDEX EXISTS\n");
+        return;
+    }
+    open = strchr(p, '(');
+    close = strrchr(sql, ')');
+    if (open == NULL || close == NULL || close <= open + 1) {
+        printf("ERR USAGE: CREATE INDEX name ON table (col)\n");
+        return;
+    }
+    *close = '\0';
+    strncpy(col_name, open + 1, MAX_NAME);
+    col_name[MAX_NAME] = '\0';
+    clean_token(col_name);
+    cidx = find_col(&tables[tidx], col_name);
+    if (cidx < 0) {
+        printf("ERR BAD INDEX COLUMN\n");
+        return;
+    }
+    strncpy(tables[tidx].index_names[tables[tidx].index_count], idx_name,
+            MAX_NAME);
+    tables[tidx].index_names[tables[tidx].index_count][MAX_NAME] = '\0';
+    tables[tidx].index_cols[tables[tidx].index_count] = cidx;
+    tables[tidx].index_count++;
+    if (!load_rows(&tables[tidx], rows, &row_count)) {
+        printf("ERR CANNOT READ TABLE\n");
+        return;
+    }
+    if (!rebuild_indexes(&tables[tidx], rows, row_count)) {
+        printf("ERR CANNOT WRITE INDEX\n");
+        return;
+    }
+    if (!save_catalog(tables, count)) {
+        printf("ERR CANNOT WRITE CATALOG\n");
+        return;
+    }
+    printf("OK INDEX CREATED\n");
 }
 
 static void cmd_insert(struct TableDef tables[], int count, char *sql)
@@ -874,6 +1297,17 @@ static void cmd_insert(struct TableDef tables[], int count, char *sql)
         printf("ERR TOO MANY ROWS\n");
         return;
     }
+    if (tables[idx].pk_col >= 0) {
+        if (vals[tables[idx].pk_col][0] == '\0') {
+            printf("ERR PRIMARY KEY REQUIRED\n");
+            return;
+        }
+        if (find_pk_duplicate(&tables[idx], rows, row_count,
+                              vals[tables[idx].pk_col], -1) >= 0) {
+            printf("ERR DUPLICATE PRIMARY KEY\n");
+            return;
+        }
+    }
     for (i = 0; i < val_count; i++) {
         strncpy(rows[row_count].values[i], vals[i], MAX_VALUE);
         rows[row_count].values[i][MAX_VALUE] = '\0';
@@ -889,10 +1323,15 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
 {
     char name[MAX_NAME + 1];
     char *p;
+    char *where;
     int idx;
     int r;
     int c;
     int row_count = 0;
+    int out_count = 0;
+    int where_col;
+    int index_no;
+    char where_val[MAX_VALUE + 1];
     struct Row rows[MAX_ROWS];
 
     if (!starts_i(sql, "SELECT * FROM")) {
@@ -914,8 +1353,9 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         printf("ERR TABLE NOT FOUND\n");
         return;
     }
-    if (!load_rows(&tables[idx], rows, &row_count)) {
-        printf("ERR CANNOT READ TABLE\n");
+    where = find_i(p, "WHERE");
+    if (!parse_where(&tables[idx], where, &where_col, where_val)) {
+        printf("ERR BAD WHERE\n");
         return;
     }
     for (c = 0; c < tables[idx].col_count; c++) {
@@ -925,7 +1365,48 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         printf("%s", tables[idx].cols[c]);
     }
     printf("\n");
+
+    index_no = find_index_col(&tables[idx], where_col);
+    if (where_col >= 0 && index_no >= 0) {
+        for (r = 1; r <= MAX_ROWS; r++) {
+            char key[KV_KEY];
+            char val[MAX_VALUE + 1];
+            int found;
+            struct Row row;
+
+            kv_make_index_key(key, tables[idx].name,
+                              tables[idx].index_names[index_no], r);
+            if (!kv_get(key, val, sizeof(val)) || !eqi(val, where_val)) {
+                continue;
+            }
+            if (!load_row_slot(&tables[idx], r, &row, &found)) {
+                printf("ERR CANNOT READ TABLE\n");
+                return;
+            }
+            if (!found || !where_match(&row, where_col, where_val)) {
+                continue;
+            }
+            for (c = 0; c < tables[idx].col_count; c++) {
+                if (c > 0) {
+                    printf(" | ");
+                }
+                printf("%s", row.values[c]);
+            }
+            printf("\n");
+            out_count++;
+        }
+        printf("OK %d ROWS\n", out_count);
+        return;
+    }
+
+    if (!load_rows(&tables[idx], rows, &row_count)) {
+        printf("ERR CANNOT READ TABLE\n");
+        return;
+    }
     for (r = 0; r < row_count; r++) {
+        if (!where_match(&rows[r], where_col, where_val)) {
+            continue;
+        }
         for (c = 0; c < tables[idx].col_count; c++) {
             if (c > 0) {
                 printf(" | ");
@@ -933,8 +1414,9 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
             printf("%s", rows[r].values[c]);
         }
         printf("\n");
+        out_count++;
     }
-    printf("OK %d ROWS\n", row_count);
+    printf("OK %d ROWS\n", out_count);
 }
 
 static int parse_where(struct TableDef *t, char *where_text,
@@ -1082,6 +1564,10 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
         printf("ERR BAD SET COLUMN\n");
         return;
     }
+    if (tables[idx].pk_col == set_col) {
+        printf("ERR CANNOT UPDATE PRIMARY KEY\n");
+        return;
+    }
     if (!parse_where(&tables[idx], where, &where_col, where_val)) {
         printf("ERR BAD WHERE\n");
         return;
@@ -1132,6 +1618,10 @@ static void cmd_drop(struct TableDef tables[], int *count, char *sql)
             return;
         }
     }
+    if (!delete_index_rows(&tables[idx])) {
+        printf("ERR CANNOT DELETE INDEX\n");
+        return;
+    }
     for (i = idx; i < *count - 1; i++) {
         tables[i] = tables[i + 1];
     }
@@ -1147,6 +1637,9 @@ static void cmd_help(void)
 {
     printf("COMMANDS:\n");
     printf("  CREATE TABLE name (col1, col2, ...);\n");
+    printf("  CREATE TABLE name (id PRIMARY KEY, col2, ...);\n");
+    printf("  CREATE TABLE name (id, col2, PRIMARY KEY (id));\n");
+    printf("  CREATE INDEX idx ON name (col);\n");
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
     printf("  SELECT * FROM name [WHERE col=value];\n");
     printf("  UPDATE name SET col=value WHERE col=value;\n");
@@ -1187,6 +1680,8 @@ static void execute(char *sql)
         cmd_schema(tables, table_count, s);
     } else if (starts_i(s, "CREATE TABLE")) {
         cmd_create(tables, &table_count, s);
+    } else if (starts_i(s, "CREATE INDEX")) {
+        cmd_create_index(tables, table_count, s);
     } else if (starts_i(s, "INSERT INTO")) {
         cmd_insert(tables, table_count, s);
     } else if (starts_i(s, "SELECT")) {
