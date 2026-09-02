@@ -1,15 +1,16 @@
 # minisql
 
-`minisql` je jednostavna SQL baza za MVS 3.8j / TK5. Program je pisan u C-u
-za `cc370`, a build koristi lokalni `mbt` koji se nalazi u ovom direktoriju.
+`minisql` is a small SQL database for MVS 3.8j / TK5. The program is written
+in C for `cc370`, and the build uses the local `mbt` toolchain in this
+directory.
 
-Baza se na MVS-u sprema u VSAM KSDS cluster `IBMUSER.MINISQL.KV`. Program ga
-otvara preko DD imena `MINIKV`, pa se isti load modul moze pokretati nad
-razlicitim VSAM bazama ako se u JCL-u promijeni `MINIKV DD`.
+The database is stored on MVS in the VSAM KSDS cluster `IBMUSER.MINISQL.KV`.
+The program opens it through DD name `MINIKV`, so the same load module can run
+against a different VSAM database by changing the `MINIKV DD` statement.
 
-## Funkcije projekta
+## Project Features
 
-Projekt podrzava osnovni SQL tok za male tablice:
+The project supports a small SQL workflow for small tables:
 
 ```sql
 CREATE TABLE LJUDI (ID INT PRIMARY KEY, IME VARCHAR(8), GRAD CHAR(8));
@@ -17,12 +18,14 @@ INSERT INTO LJUDI VALUES (1, 'ANA', 'ZAGREB');
 SELECT * FROM LJUDI;
 CREATE INDEX IDXGRAD ON LJUDI (GRAD);
 SELECT * FROM LJUDI WHERE GRAD='ZAGREB';
+SELECT * FROM LJUDI WHERE ID BETWEEN 1 AND 3;
+SELECT * FROM LJUDI WHERE IME LIKE 'A%' OR GRAD='RIJEKA';
 UPDATE LJUDI SET GRAD='RIJEKA' WHERE ID=1;
 DELETE FROM LJUDI WHERE ID=1;
 DROP TABLE LJUDI;
 ```
 
-Dodatne komande:
+Utility commands:
 
 ```text
 .TABLES
@@ -31,71 +34,66 @@ Dodatne komande:
 .QUIT
 ```
 
-Datoteke:
+Files:
 
-- `src/minisql.c` - SQL parser, izvrsavanje komandi i VSAM key/value storage.
-- `src/msqltso.c` - TSO build wrapper za isti SQL engine.
-- `asm/msqtget.asm` - C-callable TSO `TGET` wrapper za interaktivni input.
-- `asm/msqtput.asm` - C-callable TSO `TPUT` wrapper za normalan TSO output.
-- `clist/MSQL.clist` - TSO CLIST koji alocira `MINIKV`, pokrece
-  `MSQLTSO` i oslobadja DD nakon izlaza.
-- `Makefile` - ukljucuje lokalni `mbt/mk/mbt.mk`.
-- `project.toml` - MBT projekt, modul `MINISQL`, deploy target
-  `IBMUSER.MINISQL.LOAD`.
-- `jcl/COMPILE.jcl` - prima MBT XMIT paket u load biblioteku
-  `IBMUSER.MINISQL.LOAD`.
-- `jcl/ALLOCVS.jcl` - kreira i inicijalizira VSAM KSDS
-  `IBMUSER.MINISQL.KV`.
-- `jcl/MINISQL.jcl` - primjer pokretanja programa s SQL komandama u `SYSIN`.
-- `jcl/MSQLTSO.jcl` - samo primjer TSO `CALL` okruzenja. Interaktivni
-  `MSQLTSO` treba pokrenuti iz foreground TSO sesije.
-- `jcl/RECEIVE.jcl` - prima MBT XMIT paket u load biblioteku
-  `IBMUSER.MINISQL.LOAD`.
+- `src/minisql.c` - SQL parser, command execution, and VSAM key/value storage.
+- `src/msqltso.c` - TSO build wrapper for the same SQL engine.
+- `asm/msqtget.asm` - C-callable TSO `TGET` wrapper for interactive input.
+- `asm/msqtput.asm` - C-callable TSO `TPUT` wrapper for normal TSO output.
+- `clist/MSQL.clist` - TSO CLIST that allocates `MINIKV`, starts `MSQLTSO`,
+  and frees the DD after exit.
+- `Makefile` - includes the local `mbt/mk/mbt.mk`.
+- `project.toml` - MBT project definition and deploy target.
+- `jcl/COMPILE.jcl` - receives the MBT XMIT package into the load library.
+- `jcl/ALLOCVS.jcl` - creates and initializes `IBMUSER.MINISQL.KV`.
+- `jcl/MINISQL.jcl` - batch SQL test using `SYSIN`.
+- `jcl/MSQLTSO.jcl` - example TSO `CALL` environment.
+- `jcl/RECEIVE.jcl` - receives the MBT XMIT package into the load library.
 
-## Build lokalnim MBT-om
+## Build With Local MBT
 
-Build se pokrece iz root direktorija projekta:
+Run the build from the project root:
 
 ```bash
 make VERBOSE=1
 ```
 
-Ocekivani rezultat su load moduli:
+Expected load modules:
 
 ```text
 build/MINISQL
 build/MSQLTSO
 ```
 
-Za generiranje XMIT deploy paketa:
+Generate the XMIT deploy package:
 
 ```bash
 make deploy ARGS=--dry-run VERBOSE=1
 ```
 
-Ocekivani rezultat je:
+Expected output:
 
 ```text
 build/minisql.deploy.xmit
 ```
 
-## Priprema PDS-a na MVS-u
+## Prepare The MVS PDS
 
-Ako PDS jos ne postoji, kreiraj ga preko Zowe:
+If the PDS does not exist yet, create it with Zowe:
 
 ```bash
 zowe zos-files create data-set-partitioned IBMUSER.MINISQL \
   --record-format FB \
   --record-length 80 \
   --block-size 3120 \
-  --directory-blocks 10 \
-  --primary-space 5 \
-  --secondary-space 2 \
+  --directory-blocks 20 \
+  --primary-space 25 \
+  --secondary-space 10 \
   --allocation-space-unit TRK \
   --zosmf-profile hercules
 ```
 
-Upload source/JCL membera u PDS:
+Upload source and JCL members:
 
 ```bash
 zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(MINISQL)" \
@@ -120,13 +118,13 @@ zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(RUNJCL)" \
   --zosmf-profile hercules < jcl/MINISQL.jcl
 ```
 
-Lista membera u PDS-u:
+List PDS members:
 
 ```bash
 zowe zos-files list all-members IBMUSER.MINISQL --zosmf-profile hercules
 ```
 
-CLIST za jednostavno TSO pokretanje uploadan je u `SYS2.CMDPROC(MSQL)`:
+Upload the TSO launcher CLIST:
 
 ```bash
 zowe zos-files upload file-to-data-set clist/MSQL.clist \
@@ -134,10 +132,10 @@ zowe zos-files upload file-to-data-set clist/MSQL.clist \
   --zosmf-profile hercules
 ```
 
-## Deploy load modula
+## Deploy Load Modules
 
-Nakon `make deploy ARGS=--dry-run VERBOSE=1`, upload XMIT paketa u staging
-dataset:
+After `make deploy ARGS=--dry-run VERBOSE=1`, upload the XMIT package to the
+staging data set:
 
 ```bash
 zowe zos-files upload file-to-data-set build/minisql.deploy.xmit \
@@ -146,7 +144,7 @@ zowe zos-files upload file-to-data-set build/minisql.deploy.xmit \
   --zosmf-profile hercules
 ```
 
-Zatim submitaj lokalni RECEIVE job:
+Then submit the local RECEIVE job:
 
 ```bash
 zowe zos-jobs submit local-file jcl/RECEIVE.jcl \
@@ -154,21 +152,21 @@ zowe zos-jobs submit local-file jcl/RECEIVE.jcl \
   --zosmf-profile hercules
 ```
 
-Ako radis iz MVS PDS-a, isti posao radi member `IBMUSER.MINISQL(COMPILE)`.
-U njemu je RECEIVE dio za `IBMUSER.MBT.XMIT.IN -> IBMUSER.MINISQL.LOAD`.
+If you work from the MVS PDS, member `IBMUSER.MINISQL(COMPILE)` performs the
+same RECEIVE step for `IBMUSER.MBT.XMIT.IN -> IBMUSER.MINISQL.LOAD`.
 
-Ako job zavrsi s `CC 0000`, load moduli su primljeni u:
+When the job ends with `CC 0000`, the load modules are available as:
 
 ```text
 IBMUSER.MINISQL.LOAD(MINISQL)
 IBMUSER.MINISQL.LOAD(MSQLTSO)
 ```
 
-## Kreiranje VSAM baze
+## Create The VSAM Database
 
-`jcl/ALLOCVS.jcl` brise stari cluster i kreira novi. Cluster koristi
-`KEYS(64 0)` i `RECORDSIZE(256 256)`, sto odgovara trenutnom `KV_KEY` i
-`KV_DATA` layoutu u programu:
+`jcl/ALLOCVS.jcl` deletes the old cluster and creates a new one. The cluster
+uses `KEYS(64 0)` and `RECORDSIZE(256 256)`, matching the current `KV_KEY` and
+`KV_DATA` layout in the program:
 
 ```text
 IBMUSER.MINISQL.KV
@@ -182,12 +180,12 @@ zowe zos-jobs submit local-file jcl/ALLOCVS.jcl \
   --zosmf-profile hercules
 ```
 
-Pokreni ovaj job kada zelis resetirati bazu. Ako zelis sacuvati podatke, nemoj
-ponovno submitati `ALLOCVS.jcl`.
+Run this job when you want to reset the database. Do not submit `ALLOCVS.jcl`
+again if you want to keep existing data.
 
-## Koristenje unutar JCL-a
+## Use From JCL
 
-Program se pokrece kao batch program:
+The batch program is started as `PGM=MINISQL`:
 
 ```jcl
 //RUN      EXEC PGM=MINISQL
@@ -201,35 +199,37 @@ INSERT INTO LJUDI VALUES (1, 'ANA', 'ZAGREB');
 CREATE INDEX IDXGRAD ON LJUDI (GRAD);
 SELECT * FROM LJUDI;
 SELECT * FROM LJUDI WHERE GRAD='ZAGREB';
+SELECT * FROM LJUDI WHERE ID > 0 AND IME LIKE 'A%';
 .QUIT
 /*
 ```
 
-Bitni DD statementi:
+Important DD statements:
 
-- `STEPLIB` pokazuje na load biblioteku gdje je `MINISQL`.
-- `MINIKV` pokazuje na VSAM KSDS koji program koristi kao bazu.
-- `SYSIN` sadrzi SQL komande.
-- `SYSPRINT` sadrzi rezultat programa.
+- `STEPLIB` points to the load library containing `MINISQL`.
+- `MINIKV` points to the VSAM KSDS used as the database.
+- `SYSIN` contains SQL commands.
+- `SYSPRINT` contains program output.
 
-Svaka SQL komanda treba zavrsiti sa `;`. Komande `.TABLES`, `.SCHEMA`,
-`.HELP` i `.QUIT` mogu biti bez `;`. U TSO sesiji `//HELP` i `//QUIT` rade
-kao aliasi za `.HELP` i `.QUIT`.
+Each SQL command must end with `;`. Commands `.TABLES`, `.SCHEMA`, `.HELP`,
+and `.QUIT` may be entered without `;`. In a TSO session, `//HELP` and
+`//QUIT` are accepted as aliases for `.HELP` and `.QUIT`.
 
-## Testiranje u JCL-u
+## Test From JCL
 
-Standardni batch test je `jcl/MINISQL.jcl`. Taj job:
+The standard batch test is `jcl/MINISQL.jcl`. The job:
 
-- kreira tablicu `LJUDI` s `ID PRIMARY KEY`
-- ubacuje dva retka
-- testira `INT` validaciju i `VARCHAR` duzinu
-- kreira sekundarni indeks `IDXGRAD` na koloni `GRAD`
-- prikazuje `.SCHEMA LJUDI`
-- testira `SELECT * FROM LJUDI`
-- testira `SELECT * FROM LJUDI WHERE GRAD='RIJEKA'`
-- testira `UPDATE` i `DELETE`
+- creates table `LJUDI` with `ID PRIMARY KEY`
+- inserts two valid rows
+- tests `INT` validation and `VARCHAR` length validation
+- creates secondary index `IDXGRAD` on column `GRAD`
+- prints `.SCHEMA LJUDI`
+- tests `SELECT * FROM LJUDI`
+- tests `SELECT * FROM LJUDI WHERE GRAD='RIJEKA'`
+- tests `WHERE` expressions with `AND`, `OR`, `LIKE`, `<`, `>` and `BETWEEN`
+- tests `UPDATE` and `DELETE`
 
-Prvo resetiraj VSAM bazu ako zelis cist test:
+First reset the VSAM database if you want a clean test:
 
 ```bash
 zowe zos-jobs submit local-file jcl/ALLOCVS.jcl \
@@ -237,7 +237,7 @@ zowe zos-jobs submit local-file jcl/ALLOCVS.jcl \
   --zosmf-profile hercules
 ```
 
-Zatim submitaj SQL test:
+Then submit the SQL test:
 
 ```bash
 zowe zos-jobs submit local-file jcl/MINISQL.jcl \
@@ -245,7 +245,7 @@ zowe zos-jobs submit local-file jcl/MINISQL.jcl \
   --zosmf-profile hercules
 ```
 
-Primjer uspjesnog rezultata:
+Example successful result:
 
 ```text
 jobid:   JOB00805
@@ -254,17 +254,16 @@ jobname: MINISQL
 status:  OUTPUT
 ```
 
-`JOB00805` ce na tvom sistemu biti drugi broj. Taj broj koristi za dohvat
-spool outputa.
+Your `JOBID` will be different. Use that job id to retrieve spool output.
 
-Prvo izlistaj spool datoteke za job:
+List spool files:
 
 ```bash
 zowe zos-jobs list spool-files-by-jobid JOB00805 \
   --zosmf-profile hercules
 ```
 
-Primjer:
+Example:
 
 ```text
 1   JESJCLIN   JES2
@@ -275,14 +274,14 @@ Primjer:
 103 SYSPRINT   RUN
 ```
 
-Rezultat programa je u `SYSPRINT`. Procitaj ga preko DDID-a iz liste:
+Program output is in `SYSPRINT`. Read it by DDID:
 
 ```bash
 zowe zos-jobs view spool-file-by-id JOB00805 103 \
   --zosmf-profile hercules
 ```
 
-Ocekivani bitni dijelovi outputa:
+Expected important output:
 
 ```text
 OK TABLE CREATED
@@ -296,20 +295,20 @@ ID | IME | GRAD
 OK 1 ROWS
 ```
 
-## Testiranje u TSO-u
+## Test From TSO
 
-Interaktivni processor je load modul `MSQLTSO`. Najjednostavnije se pokrece
-preko CLIST-a `SYS2.CMDPROC(MSQL)`, koji sam alocira VSAM DD `MINIKV`,
-pozove load modul i na izlazu napravi `FREE FI(MINIKV)`.
+The interactive processor is load module `MSQLTSO`. The easiest way to start
+it is through CLIST `SYS2.CMDPROC(MSQL)`. The CLIST allocates VSAM DD
+`MINIKV`, calls the load module, and runs `FREE FI(MINIKV)` after exit.
 
-U foreground TSO sesiji pokreni:
+From a foreground TSO session, run:
 
 ```text
 MSQL
 ```
 
-Ako CLIST nije u tvojem `SYSPROC`/`SYSEXEC` search pathu, pokreni ga kao TSO
-komandu iz odgovarajuceg command procedure libraryja ili rucno napravi:
+If the CLIST is not in your `SYSPROC` or `SYSEXEC` search path, run it from
+the appropriate command procedure library, or start the processor manually:
 
 ```text
 ALLOC FI(MINIKV) DA('IBMUSER.MINISQL.KV') OLD
@@ -317,7 +316,7 @@ CALL 'IBMUSER.MINISQL.LOAD(MSQLTSO)'
 FREE FI(MINIKV)
 ```
 
-Primjer interaktivnog testa:
+Interactive test:
 
 ```sql
 .TABLES
@@ -327,6 +326,9 @@ SELECT * FROM LJUDI WHERE GRAD='RIJEKA';
 INSERT INTO LJUDI VALUES (3, 'PERO', 'RIJEKA');
 INSERT INTO LJUDI VALUES ('ABC', 'PERO', 'RIJEKA');
 INSERT INTO LJUDI VALUES (4, 'PREDUGOIME', 'RIJEKA');
+SELECT * FROM LJUDI WHERE ID > 1 AND GRAD LIKE 'RI%';
+SELECT * FROM LJUDI WHERE ID BETWEEN 1 AND 3;
+SELECT * FROM LJUDI WHERE IME LIKE 'P%' OR GRAD='SPLIT';
 SELECT * FROM LJUDI WHERE GRAD='RIJEKA';
 UPDATE LJUDI SET GRAD='SISAK' WHERE ID=3;
 SELECT * FROM LJUDI WHERE GRAD='RIJEKA';
@@ -336,29 +338,31 @@ UPDATE LJUDI SET ID=4 WHERE ID=3;
 .QUIT
 ```
 
-Ocekivano ponasanje:
+Expected behavior:
 
-- `.SCHEMA LJUDI` prikazuje `ID PRIMARY KEY` i `INDEX IDXGRAD ON LJUDI(GRAD)`
-- `SELECT ... WHERE GRAD='RIJEKA'` koristi sekundarni indeks ako postoji
-- `ID` prima samo cijeli broj jer je `INT`
-- `IME` prima najvise 8 znakova jer je `VARCHAR(8)`
-- dupli `ID=3` vraca `ERR DUPLICATE PRIMARY KEY`
-- promjena primary key kolone vraca `ERR CANNOT UPDATE PRIMARY KEY`
-- promjena ne-key kolone, npr. `GRAD`, radi i automatski obnavlja indeks
+- `.SCHEMA LJUDI` shows `ID PRIMARY KEY` and `INDEX IDXGRAD ON LJUDI(GRAD)`.
+- `SELECT ... WHERE GRAD='RIJEKA'` uses the secondary index when available.
+- `WHERE` supports `AND`, `OR`, `LIKE`, `<`, `>` and `BETWEEN`.
+- `ID` accepts only whole numbers because it is `INT`.
+- `IME` accepts at most 8 characters because it is `VARCHAR(8)`.
+- duplicate `ID=3` returns `ERR DUPLICATE PRIMARY KEY`.
+- changing a primary key column returns `ERR CANNOT UPDATE PRIMARY KEY`.
+- changing a non-key column such as `GRAD` works and rebuilds indexes.
 
-Na kraju mozes osloboditi DD:
+At the end, release the DD if you started `MSQLTSO` manually:
 
 ```text
 FREE FI(MINIKV)
 ```
 
-Napomena: `MSQLTSO` nije batch SQL runner. Nakon prelaska na `TGET`, Zowe
-batch submit preko `IKJEFT01` ne moze glumiti pravu interaktivnu terminalsku
-sesiju. Za batch SQL koristi `MINISQL` i `jcl/MINISQL.jcl`.
+Note: `MSQLTSO` is a foreground interactive TSO program. After switching to
+`TGET`, a Zowe batch submit through `IKJEFT01` cannot emulate a real
+interactive terminal session. For batch SQL, use `MINISQL` and
+`jcl/MINISQL.jcl`.
 
-## Submit SQL joba preko Zowe
+## Submit SQL Jobs With Zowe
 
-Kratki primjer pokretanja postojeceg JCL-a:
+Submit the existing JCL:
 
 ```bash
 zowe zos-jobs submit local-file jcl/MINISQL.jcl \
@@ -366,19 +370,19 @@ zowe zos-jobs submit local-file jcl/MINISQL.jcl \
   --zosmf-profile hercules
 ```
 
-Za dohvat outputa prvo izlistaj DD-ove:
+List DDs for the job:
 
 ```bash
 zowe zos-jobs list spool-files-by-jobid JOBID --zosmf-profile hercules
 ```
 
-Zatim procitaj `SYSPRINT` DDID, npr. `103`:
+Read the `SYSPRINT` DDID, for example `103`:
 
 ```bash
 zowe zos-jobs view spool-file-by-id JOBID 103 --zosmf-profile hercules
 ```
 
-## Brzi end-to-end tok
+## Quick End-To-End Flow
 
 ```bash
 make VERBOSE=1
@@ -403,49 +407,51 @@ zowe zos-jobs submit local-file jcl/MINISQL.jcl \
   --zosmf-profile hercules
 ```
 
-Zatim dohvati `SYSPRINT`:
+Then retrieve `SYSPRINT`:
 
 ```bash
 zowe zos-jobs list spool-files-by-jobid JOBID --zosmf-profile hercules
 zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 ```
 
-## Ogranicenja
+## Limitations
 
-- Podrzani SQL tipovi su `INT`/`INTEGER`, `CHAR(n)`, `VARCHAR(n)` i `TEXT`.
-- Tipovi su validacijski metadata. Vrijednosti se i dalje spremaju kao tekst
-  u VSAM row payloadu.
-- `INT` podrzava opcionalni `+`/`-` i decimalne znamenke, ali nema aritmetike
-  ni numeric sort/compare operacija.
-- `CHAR(n)` i `VARCHAR(n)` provjeravaju maksimalnu duzinu. `CHAR(n)` se ne
-  pad-a razmacima na fiksnu duzinu.
-- Nema SQL tipova `DATE`, `TIME`, `DECIMAL`, `FLOAT`, `BOOLEAN` ili `BLOB`.
-- Vrijednosti se ciste i spremaju uppercase; navodnici se koriste samo za
-  parsiranje vrijednosti s razmacima ili jasniji SQL izgled.
-- Nema `NULL`, default vrijednosti, constrainta osim jednog primary keya,
-  foreign keyeva ni check constrainta.
-- Maksimalno 32 tablice.
-- Maksimalno 8 kolona po tablici.
-- Maksimalno 32 retka po tablici.
-- Maksimalno 4 sekundarna indeksa po tablici.
-- `PRIMARY KEY` podrzava samo jednu kolonu.
-- `CREATE INDEX` podrzava samo jednu kolonu po indeksu.
-- Imena tablica, kolona i indeksa mogu imati najvise 16 znakova.
-- Vrijednost jedne kolone moze imati najvise 32 znaka.
-- Jedan spremljeni row payload mora stati u 192 bajta, ukljucujuci zareze
-  izmedju vrijednosti.
-- VSAM record layout je fiksan: key 64 bajta, data 192 bajta, ukupno 256
-  bajtova. Ako se taj layout promijeni, `IBMUSER.MINISQL.KV` treba ponovno
-  kreirati s `jcl/ALLOCVS.jcl`.
-- Podrzan je samo `SELECT * FROM table` i opcionalni
-  `WHERE kolona=vrijednost`.
-- `WHERE` podrzava samo jednakost, bez `AND`, `OR`, `LIKE`, `<`, `>`,
-  `BETWEEN` ili izraza.
-- Sekundarni indeks se koristi samo za `SELECT * FROM table WHERE col=value`
-  kada postoji indeks na `col`; nema opceg SQL optimizatora.
-- `UPDATE` podrzava jedan `SET col=value` i opcionalni `WHERE`.
-- `DELETE` podrzava opcionalni `WHERE`; bez `WHERE` brise sve retke tablice.
-- Nema joinova, order by, group by, agregacija, pogleda, stored procedura,
-  transakcija, rollbacka ni recovery loga.
-- `MSQLTSO` je interaktivni foreground TSO program. Za batch SQL koristi se
-  `MINISQL`, ne `MSQLTSO`.
+- Supported SQL types are `INT`/`INTEGER`, `CHAR(n)`, `VARCHAR(n)` and `TEXT`.
+- Types are validation metadata. Values are still stored as text in the VSAM
+  row payload.
+- `INT` supports optional `+`/`-`, decimal digits, and numeric comparison in
+  `WHERE` operators `<`, `>` and `BETWEEN`.
+- `CHAR(n)` and `VARCHAR(n)` validate maximum length. `CHAR(n)` is not padded
+  with spaces to a fixed length.
+- SQL types `DATE`, `TIME`, `DECIMAL`, `FLOAT`, `BOOLEAN` and `BLOB` are not
+  supported.
+- Values are normalized and stored uppercase. Quotes are used only for parsing
+  values containing spaces or for clearer SQL syntax.
+- There is no `NULL`, default values, constraints except one primary key,
+  foreign keys, or check constraints.
+- Maximum 32 tables.
+- Maximum 8 columns per table.
+- Maximum 32 rows per table.
+- Maximum 4 secondary indexes per table.
+- `PRIMARY KEY` supports one column only.
+- `CREATE INDEX` supports one column per index.
+- Table, column, and index names may have at most 16 characters.
+- One column value may have at most 32 characters.
+- One stored row payload must fit in 192 bytes, including commas between
+  values.
+- VSAM record layout is fixed: 64-byte key, 192-byte data, 256 bytes total. If
+  this layout changes, recreate `IBMUSER.MINISQL.KV` with `jcl/ALLOCVS.jcl`.
+- Only `SELECT * FROM table` is supported, with an optional `WHERE` expression.
+- `WHERE` supports `=`, `<`, `>`, `LIKE`, `BETWEEN`, `AND` and `OR`.
+- `WHERE` does not support parentheses, `NOT`, `<=`, `>=`, `<>`, `!=`, `IN`,
+  `IS NULL`, or functions.
+- `AND` has higher precedence than `OR`, as in SQL.
+- A secondary index is used only for `SELECT * FROM table WHERE col=value`
+  when an index exists on `col`; complex `WHERE` expressions use a linear scan.
+- `UPDATE` supports one `SET col=value` and an optional `WHERE` expression.
+- `DELETE` supports an optional `WHERE` expression; without `WHERE`, it deletes
+  all rows in the table.
+- There are no joins, order by, group by, aggregates, views, stored
+  procedures, transactions, rollback, or recovery log.
+- `MSQLTSO` is an interactive foreground TSO program. Use `MINISQL`, not
+  `MSQLTSO`, for batch SQL.

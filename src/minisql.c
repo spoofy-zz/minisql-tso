@@ -28,6 +28,14 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define TYPE_INT 1
 #define TYPE_CHAR 2
 #define TYPE_VARCHAR 3
+#define MAX_CONDS 8
+#define OP_EQ 1
+#define OP_LT 2
+#define OP_GT 3
+#define OP_LIKE 4
+#define OP_BETWEEN 5
+#define LOGIC_AND 1
+#define LOGIC_OR 2
 
 struct TableDef {
     char name[MAX_NAME + 1];
@@ -45,6 +53,19 @@ struct Row {
     char values[MAX_COLS][MAX_VALUE + 1];
 };
 
+struct WhereCond {
+    int col;
+    int op;
+    char value1[MAX_VALUE + 1];
+    char value2[MAX_VALUE + 1];
+};
+
+struct WhereExpr {
+    int cond_count;
+    int logic[MAX_CONDS - 1];
+    struct WhereCond conds[MAX_CONDS];
+};
+
 struct KvRec {
     char key[KV_KEY];
     char data[KV_DATA];
@@ -52,7 +73,7 @@ struct KvRec {
 
 static void rtrim(char *s);
 static int parse_where(struct TableDef *t, char *where_text,
-                       int *where_col, char *where_val);
+                       struct WhereExpr *expr);
 static int validate_value(struct TableDef *t, int col, const char *value);
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
@@ -670,6 +691,117 @@ static int validate_value(struct TableDef *t, int col, const char *value)
     return 1;
 }
 
+static int cmp_value(struct TableDef *t, int col,
+                     const char *left, const char *right)
+{
+    long a;
+    long b;
+
+    if (t->col_types[col] == TYPE_INT) {
+        a = atol(left);
+        b = atol(right);
+        if (a < b) {
+            return -1;
+        }
+        if (a > b) {
+            return 1;
+        }
+        return 0;
+    }
+    return strcmp(left, right);
+}
+
+static int like_match(const char *text, const char *pat)
+{
+    if (*pat == '\0') {
+        return *text == '\0';
+    }
+    if (*pat == '%') {
+        while (*pat == '%') {
+            pat++;
+        }
+        if (*pat == '\0') {
+            return 1;
+        }
+        while (*text != '\0') {
+            if (like_match(text, pat)) {
+                return 1;
+            }
+            text++;
+        }
+        return like_match(text, pat);
+    }
+    if (*pat == '_') {
+        return *text != '\0' && like_match(text + 1, pat + 1);
+    }
+    if (toupper((unsigned char)*text) !=
+        toupper((unsigned char)*pat)) {
+        return 0;
+    }
+    return like_match(text + 1, pat + 1);
+}
+
+static int eval_cond(struct TableDef *t, struct Row *row,
+                     struct WhereCond *cond)
+{
+    const char *val = row->values[cond->col];
+    int cmp1;
+    int cmp2;
+
+    if (cond->op == OP_EQ) {
+        return eqi(val, cond->value1);
+    }
+    if (cond->op == OP_LT) {
+        return cmp_value(t, cond->col, val, cond->value1) < 0;
+    }
+    if (cond->op == OP_GT) {
+        return cmp_value(t, cond->col, val, cond->value1) > 0;
+    }
+    if (cond->op == OP_LIKE) {
+        return like_match(val, cond->value1);
+    }
+    if (cond->op == OP_BETWEEN) {
+        cmp1 = cmp_value(t, cond->col, val, cond->value1);
+        cmp2 = cmp_value(t, cond->col, val, cond->value2);
+        return cmp1 >= 0 && cmp2 <= 0;
+    }
+    return 0;
+}
+
+static int where_match(struct TableDef *t, struct Row *row,
+                       struct WhereExpr *expr)
+{
+    int i;
+    int any_or;
+    int current;
+
+    if (expr->cond_count == 0) {
+        return 1;
+    }
+    any_or = 0;
+    current = eval_cond(t, row, &expr->conds[0]);
+    for (i = 1; i < expr->cond_count; i++) {
+        if (expr->logic[i - 1] == LOGIC_AND) {
+            current = current && eval_cond(t, row, &expr->conds[i]);
+        } else {
+            any_or = any_or || current;
+            current = eval_cond(t, row, &expr->conds[i]);
+        }
+    }
+    return any_or || current;
+}
+
+static int where_simple_eq(struct WhereExpr *expr, int *col, char *value)
+{
+    if (expr->cond_count != 1 || expr->conds[0].op != OP_EQ) {
+        return 0;
+    }
+    *col = expr->conds[0].col;
+    strncpy(value, expr->conds[0].value1, MAX_VALUE);
+    value[MAX_VALUE] = '\0';
+    return 1;
+}
+
 static int parse_csv(char *text, char values[MAX_COLS][MAX_VALUE + 1],
                      int *count)
 {
@@ -1148,14 +1280,6 @@ static int save_rows(struct TableDef *t, struct Row rows[], int row_count)
     return 1;
 }
 
-static int where_match(struct Row *row, int where_col, const char *where_val)
-{
-    if (where_col < 0) {
-        return 1;
-    }
-    return eqi(row->values[where_col], where_val);
-}
-
 static void print_select_line(struct TableDef *t, struct Row *row, int header)
 {
     char line[MAX_LINE];
@@ -1540,6 +1664,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     int where_col;
     int index_no;
     char where_val[MAX_VALUE + 1];
+    struct WhereExpr expr;
     struct Row rows[MAX_ROWS];
 
     if (!starts_i(sql, "SELECT * FROM")) {
@@ -1562,18 +1687,20 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         return;
     }
     where = find_i(p, "WHERE");
-    if (!parse_where(&tables[idx], where, &where_col, where_val)) {
+    if (!parse_where(&tables[idx], where, &expr)) {
         printf("ERR BAD WHERE\n");
-        return;
-    }
-    if (where_col >= 0 &&
-        !validate_value(&tables[idx], where_col, where_val)) {
         return;
     }
     print_select_line(&tables[idx], NULL, 1);
 
-    index_no = find_index_col(&tables[idx], where_col);
-    if (where_col >= 0 && index_no >= 0) {
+    where_col = -1;
+    where_val[0] = '\0';
+    if (where_simple_eq(&expr, &where_col, where_val)) {
+        index_no = find_index_col(&tables[idx], where_col);
+    } else {
+        index_no = -1;
+    }
+    if (index_no >= 0) {
         for (r = 1; r <= MAX_ROWS; r++) {
             char key[KV_KEY];
             char val[MAX_VALUE + 1];
@@ -1589,7 +1716,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
                 printf("ERR CANNOT READ TABLE\n");
                 return;
             }
-            if (!found || !where_match(&row, where_col, where_val)) {
+            if (!found || !where_match(&tables[idx], &row, &expr)) {
                 continue;
             }
             print_select_line(&tables[idx], &row, 0);
@@ -1604,7 +1731,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         return;
     }
     for (r = 0; r < row_count; r++) {
-        if (!where_match(&rows[r], where_col, where_val)) {
+        if (!where_match(&tables[idx], &rows[r], &expr)) {
             continue;
         }
         print_select_line(&tables[idx], &rows[r], 0);
@@ -1613,14 +1740,128 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     printf("OK %d ROWS\n", out_count);
 }
 
-static int parse_where(struct TableDef *t, char *where_text,
-                       int *where_col, char *where_val)
+static int where_tokenize(char *text,
+                          char toks[][MAX_VALUE + 1], int *count)
 {
-    char *eq;
-    char col[MAX_VALUE + 1];
+    char *p = text;
+    int n = 0;
 
-    *where_col = -1;
-    where_val[0] = '\0';
+    while (*p != '\0') {
+        int i = 0;
+
+        p = ltrim(p);
+        if (*p == '\0') {
+            break;
+        }
+        if (n >= MAX_CONDS * 5) {
+            return 0;
+        }
+        if (*p == '\'' || *p == '"') {
+            char quote = *p++;
+            while (*p != '\0' && *p != quote) {
+                if (i < MAX_VALUE) {
+                    toks[n][i++] = *p;
+                }
+                p++;
+            }
+            if (*p == quote) {
+                p++;
+            }
+        } else if (*p == '=' || *p == '<' || *p == '>') {
+            toks[n][i++] = *p++;
+        } else {
+            while (*p != '\0' && !isspace((unsigned char)*p) &&
+                   *p != '=' && *p != '<' && *p != '>') {
+                if (i < MAX_VALUE) {
+                    toks[n][i++] = *p;
+                }
+                p++;
+            }
+        }
+        toks[n][i] = '\0';
+        clean_token(toks[n]);
+        n++;
+    }
+    *count = n;
+    return 1;
+}
+
+static int parse_where_cond(struct TableDef *t,
+                            char toks[][MAX_VALUE + 1],
+                            int ntok, int *pos,
+                            struct WhereCond *cond)
+{
+    int col;
+
+    if (*pos + 2 >= ntok) {
+        return 0;
+    }
+    col = find_col(t, toks[*pos]);
+    if (col < 0) {
+        return 0;
+    }
+    cond->col = col;
+    (*pos)++;
+    if (eqi(toks[*pos], "LIKE")) {
+        cond->op = OP_LIKE;
+        (*pos)++;
+        if (*pos >= ntok) {
+            return 0;
+        }
+        strncpy(cond->value1, toks[*pos], MAX_VALUE);
+        cond->value1[MAX_VALUE] = '\0';
+        cond->value2[0] = '\0';
+        (*pos)++;
+        return 1;
+    }
+    if (eqi(toks[*pos], "BETWEEN")) {
+        cond->op = OP_BETWEEN;
+        (*pos)++;
+        if (*pos + 2 >= ntok || !eqi(toks[*pos + 1], "AND")) {
+            return 0;
+        }
+        strncpy(cond->value1, toks[*pos], MAX_VALUE);
+        cond->value1[MAX_VALUE] = '\0';
+        strncpy(cond->value2, toks[*pos + 2], MAX_VALUE);
+        cond->value2[MAX_VALUE] = '\0';
+        if (!validate_value(t, col, cond->value1) ||
+            !validate_value(t, col, cond->value2)) {
+            return 0;
+        }
+        *pos += 3;
+        return 1;
+    }
+    if (eqi(toks[*pos], "=")) {
+        cond->op = OP_EQ;
+    } else if (eqi(toks[*pos], "<")) {
+        cond->op = OP_LT;
+    } else if (eqi(toks[*pos], ">")) {
+        cond->op = OP_GT;
+    } else {
+        return 0;
+    }
+    (*pos)++;
+    if (*pos >= ntok) {
+        return 0;
+    }
+    strncpy(cond->value1, toks[*pos], MAX_VALUE);
+    cond->value1[MAX_VALUE] = '\0';
+    cond->value2[0] = '\0';
+    if (!validate_value(t, col, cond->value1)) {
+        return 0;
+    }
+    (*pos)++;
+    return 1;
+}
+
+static int parse_where(struct TableDef *t, char *where_text,
+                       struct WhereExpr *expr)
+{
+    char toks[MAX_CONDS * 5][MAX_VALUE + 1];
+    int ntok = 0;
+    int pos = 0;
+
+    expr->cond_count = 0;
     if (where_text == NULL) {
         return 1;
     }
@@ -1628,19 +1869,34 @@ static int parse_where(struct TableDef *t, char *where_text,
     if (starts_i(where_text, "WHERE")) {
         where_text += strlen("WHERE");
     }
-    eq = strchr(where_text, '=');
-    if (eq == NULL) {
+    if (!where_tokenize(where_text, toks, &ntok) || ntok == 0) {
         return 0;
     }
-    *eq = '\0';
-    strncpy(col, where_text, MAX_VALUE);
-    col[MAX_VALUE] = '\0';
-    clean_token(col);
-    strncpy(where_val, eq + 1, MAX_VALUE);
-    where_val[MAX_VALUE] = '\0';
-    clean_token(where_val);
-    *where_col = find_col(t, col);
-    return *where_col >= 0;
+    while (pos < ntok) {
+        if (expr->cond_count >= MAX_CONDS) {
+            return 0;
+        }
+        if (!parse_where_cond(t, toks, ntok, &pos,
+                              &expr->conds[expr->cond_count])) {
+            return 0;
+        }
+        expr->cond_count++;
+        if (pos >= ntok) {
+            break;
+        }
+        if (expr->cond_count >= MAX_CONDS) {
+            return 0;
+        }
+        if (eqi(toks[pos], "AND")) {
+            expr->logic[expr->cond_count - 1] = LOGIC_AND;
+        } else if (eqi(toks[pos], "OR")) {
+            expr->logic[expr->cond_count - 1] = LOGIC_OR;
+        } else {
+            return 0;
+        }
+        pos++;
+    }
+    return 1;
 }
 
 static void cmd_delete(struct TableDef tables[], int count, char *sql)
@@ -1654,8 +1910,7 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
     int kept = 0;
     int deleted = 0;
     int row_count = 0;
-    int where_col;
-    char where_val[MAX_VALUE + 1];
+    struct WhereExpr expr;
     struct Row rows[MAX_ROWS];
     struct Row out[MAX_ROWS];
 
@@ -1674,12 +1929,8 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
         return;
     }
     where = find_i(p, "WHERE");
-    if (!parse_where(&tables[idx], where, &where_col, where_val)) {
+    if (!parse_where(&tables[idx], where, &expr)) {
         printf("ERR BAD WHERE\n");
-        return;
-    }
-    if (where_col >= 0 &&
-        !validate_value(&tables[idx], where_col, where_val)) {
         return;
     }
     if (!load_rows(&tables[idx], rows, &row_count)) {
@@ -1687,7 +1938,7 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
         return;
     }
     for (r = 0; r < row_count; r++) {
-        if (where_match(&rows[r], where_col, where_val)) {
+        if (where_match(&tables[idx], &rows[r], &expr)) {
             deleted++;
         } else {
             out[kept++] = rows[r];
@@ -1709,8 +1960,7 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
     char *eq;
     char set_col_name[MAX_VALUE + 1];
     char set_val[MAX_VALUE + 1];
-    char where_val[MAX_VALUE + 1];
-    int where_col;
+    struct WhereExpr expr;
     int set_col;
     int idx;
     int i = 0;
@@ -1769,12 +2019,8 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
     if (!validate_value(&tables[idx], set_col, set_val)) {
         return;
     }
-    if (!parse_where(&tables[idx], where, &where_col, where_val)) {
+    if (!parse_where(&tables[idx], where, &expr)) {
         printf("ERR BAD WHERE\n");
-        return;
-    }
-    if (where_col >= 0 &&
-        !validate_value(&tables[idx], where_col, where_val)) {
         return;
     }
     if (!load_rows(&tables[idx], rows, &row_count)) {
@@ -1782,7 +2028,7 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
         return;
     }
     for (r = 0; r < row_count; r++) {
-        if (where_match(&rows[r], where_col, where_val)) {
+        if (where_match(&tables[idx], &rows[r], &expr)) {
             strncpy(rows[r].values[set_col], set_val, MAX_VALUE);
             rows[r].values[set_col][MAX_VALUE] = '\0';
             changed++;
@@ -1848,9 +2094,10 @@ static void cmd_help(void)
     printf("  CREATE TABLE name (id, col2, PRIMARY KEY (id));\n");
     printf("  CREATE INDEX idx ON name (col);\n");
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
-    printf("  SELECT * FROM name [WHERE col=value];\n");
-    printf("  UPDATE name SET col=value WHERE col=value;\n");
-    printf("  DELETE FROM name WHERE col=value;\n");
+    printf("  SELECT * FROM name [WHERE expression];\n");
+    printf("  WHERE: =, <, >, LIKE, BETWEEN, AND, OR\n");
+    printf("  UPDATE name SET col=value WHERE expression;\n");
+    printf("  DELETE FROM name WHERE expression;\n");
     printf("  DROP TABLE name;\n");
     printf("  .TABLES\n");
     printf("  .SCHEMA name\n");
