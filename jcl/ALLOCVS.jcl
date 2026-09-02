@@ -7,8 +7,8 @@
   DEFINE CLUSTER (NAME(IBMUSER.MINISQL.KV) -
          INDEXED -
          KEYS(64 0) -
-         RECORDSIZE(256 256) -
-         RECORDS(20 10) -
+         RECORDSIZE(1024 1024) -
+         RECORDS(8000 2000) -
          SHAREOPTIONS(2 3) -
          UNIQUE -
          SPEED VOLUMES(TSO003)) -

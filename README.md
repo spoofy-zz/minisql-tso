@@ -13,8 +13,9 @@ against a different VSAM database by changing the `MINIKV DD` statement.
 The project supports a small SQL workflow for small tables:
 
 ```sql
-CREATE TABLE PEOPLE (ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8));
-INSERT INTO PEOPLE VALUES (1, 'ANA', 'ZAGREB');
+CREATE TABLE PEOPLE (ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8),
+AGE INT, EMAIL VARCHAR(16));
+INSERT INTO PEOPLE VALUES (1, 'ANA', 'ZAGREB', 30, 'ANA@EX');
 SELECT * FROM PEOPLE;
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
@@ -165,8 +166,8 @@ IBMUSER.MINISQL.LOAD(MSQLTSO)
 ## Create The VSAM Database
 
 `jcl/ALLOCVS.jcl` deletes the old cluster and creates a new one. The cluster
-uses `KEYS(64 0)` and `RECORDSIZE(256 256)`, matching the current `KV_KEY` and
-`KV_DATA` layout in the program:
+uses `KEYS(64 0)` and `RECORDSIZE(1024 1024)`, matching the current `KV_KEY`
+and `KV_DATA` layout in the program:
 
 ```text
 IBMUSER.MINISQL.KV
@@ -194,8 +195,9 @@ The batch program is started as `PGM=MINISQL`:
 //SYSOUT   DD SYSOUT=*
 //SYSPRINT DD SYSOUT=*
 //SYSIN    DD *
-CREATE TABLE PEOPLE (ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8));
-INSERT INTO PEOPLE VALUES (1, 'ANA', 'ZAGREB');
+CREATE TABLE PEOPLE (ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8),
+AGE INT, EMAIL VARCHAR(16));
+INSERT INTO PEOPLE VALUES (1, 'ANA', 'ZAGREB', 30, 'ANA@EX');
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE;
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
@@ -219,7 +221,7 @@ and `.QUIT` may be entered without `;`. In a TSO session, `//HELP` and
 
 The standard batch test is `jcl/MINISQL.jcl`. The job:
 
-- creates table `PEOPLE` with `ID PRIMARY KEY`
+- creates table `PEOPLE` with `ID PRIMARY KEY` and five columns
 - inserts two valid rows
 - tests `INT` validation and `VARCHAR` length validation
 - creates secondary index `IDXCITY` on column `CITY`
@@ -285,13 +287,14 @@ Expected important output:
 
 ```text
 OK TABLE CREATED
-PEOPLE(ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8))
+PEOPLE(ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8), AGE INT,
+EMAIL VARCHAR(16))
 ERR BAD INT VALUE
 ERR VALUE TOO LONG
 OK INDEX CREATED
 INDEX IDXCITY ON PEOPLE(CITY)
-ID | NAME | CITY
-2 | IVO | RIJEKA
+ID | NAME | CITY | AGE | EMAIL
+2 | IVO | RIJEKA | 41 | IVO@EX
 OK 1 ROWS
 ```
 
@@ -323,9 +326,9 @@ Interactive test:
 .SCHEMA PEOPLE
 SELECT * FROM PEOPLE;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
-INSERT INTO PEOPLE VALUES (3, 'PERO', 'RIJEKA');
-INSERT INTO PEOPLE VALUES ('ABC', 'PERO', 'RIJEKA');
-INSERT INTO PEOPLE VALUES (4, 'PREDUGOIME', 'RIJEKA');
+INSERT INTO PEOPLE VALUES (3, 'PERO', 'RIJEKA', 22, 'PERO@EX');
+INSERT INTO PEOPLE VALUES ('ABC', 'PERO', 'RIJEKA', 22, 'PERO@EX');
+INSERT INTO PEOPLE VALUES (4, 'PREDUGOIME', 'RIJEKA', 22, 'LONG@EX');
 SELECT * FROM PEOPLE WHERE ID > 1 AND CITY LIKE 'RI%';
 SELECT * FROM PEOPLE WHERE ID BETWEEN 1 AND 3;
 SELECT * FROM PEOPLE WHERE NAME LIKE 'P%' OR CITY='SPLIT';
@@ -430,17 +433,18 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - There is no `NULL`, default values, constraints except one primary key,
   foreign keys, or check constraints.
 - Maximum 32 tables.
-- Maximum 8 columns per table.
-- Maximum 32 rows per table.
+- Maximum 16 columns per table.
+- Maximum 128 rows per table.
 - Maximum 4 secondary indexes per table.
 - `PRIMARY KEY` supports one column only.
 - `CREATE INDEX` supports one column per index.
 - Table, column, and index names may have at most 16 characters.
 - One column value may have at most 32 characters.
-- One stored row payload must fit in 192 bytes, including commas between
+- One stored row payload must fit in 960 bytes, including commas between
   values.
-- VSAM record layout is fixed: 64-byte key, 192-byte data, 256 bytes total. If
-  this layout changes, recreate `IBMUSER.MINISQL.KV` with `jcl/ALLOCVS.jcl`.
+- VSAM record layout is fixed: 64-byte key, 960-byte data, 1024 bytes total.
+  If this layout changes, recreate `IBMUSER.MINISQL.KV` with
+  `jcl/ALLOCVS.jcl`.
 - Only `SELECT * FROM table` is supported, with an optional `WHERE` expression.
 - `WHERE` supports `=`, `<`, `>`, `LIKE`, `BETWEEN`, `AND` and `OR`.
 - `WHERE` does not support parentheses, `NOT`, `<=`, `>=`, `<>`, `!=`, `IN`,

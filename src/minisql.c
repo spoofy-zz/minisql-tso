@@ -14,14 +14,14 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 
 #define MAX_LINE 1024
 #define MAX_NAME 16
-#define MAX_COLS 8
+#define MAX_COLS 16
 #define MAX_VALUE 32
-#define MAX_ROWS 32
+#define MAX_ROWS 128
 #define MAX_TABLES 32
 #define MAX_INDEXES 4
 #define MAX_STATEMENT 2048
 #define KV_KEY 64
-#define KV_DATA 192
+#define KV_DATA 960
 #define KV_RECLEN (KV_KEY + KV_DATA)
 #define KV_DD "MINIKV"
 #define TYPE_TEXT 0
@@ -131,7 +131,7 @@ static int msql_printf(const char *fmt, ...)
 #ifdef __MVS__
 static VSFILE *g_kv = NULL;
 #else
-static struct KvRec g_host_kv[2048];
+static struct KvRec g_host_kv[32768];
 static int g_host_kv_count = 0;
 #endif
 
