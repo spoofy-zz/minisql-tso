@@ -403,6 +403,18 @@ static char *trim(char *s)
     return s;
 }
 
+static int line_is_empty_input(const char *s)
+{
+    while (*s != '\0') {
+        unsigned char c = (unsigned char)*s;
+        if (isprint(c) && !isspace(c)) {
+            return 0;
+        }
+        s++;
+    }
+    return 1;
+}
+
 static void upper_copy(char *dst, const char *src, int max)
 {
     int i;
@@ -2508,7 +2520,7 @@ static int run_processor(int interactive)
             break;
         }
         p = trim(line);
-        if (*p == '\0') {
+        if (line_is_empty_input(p)) {
             if (interactive) {
                 printf("SQL> ");
                 fflush(stdout);

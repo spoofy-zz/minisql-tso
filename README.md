@@ -320,7 +320,8 @@ MSQL
 ```
 
 At the `SQL>` prompt, pressing Enter on an empty line just redraws the prompt.
-It does not add an empty line to the pending SQL statement.
+Blank or terminal-control-only input lines do not add anything to the pending
+SQL statement.
 
 If the CLIST is not in your `SYSPROC` or `SYSEXEC` search path, run it from
 the appropriate command procedure library, or start the processor manually:
