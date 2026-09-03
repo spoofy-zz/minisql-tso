@@ -407,7 +407,7 @@ static int line_is_empty_input(const char *s)
 {
     while (*s != '\0') {
         unsigned char c = (unsigned char)*s;
-        if (isprint(c) && !isspace(c)) {
+        if (isalnum(c) || strchr(".,/*<>=_'\"()-", c) != NULL) {
             return 0;
         }
         s++;
@@ -2525,6 +2525,12 @@ static int run_processor(int interactive)
                 printf("SQL> ");
                 fflush(stdout);
             }
+            continue;
+        }
+        if (interactive && stmt[0] == '\0' &&
+            !line_starts_command(p) && strchr(p, ';') == NULL) {
+            printf("SQL> ");
+            fflush(stdout);
             continue;
         }
         if (eqi(p, ".QUIT") || eqi(p, "//QUIT") || eqi(p, "QUIT")) {
