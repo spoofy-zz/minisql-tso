@@ -16,9 +16,12 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define MAX_NAME 16
 #define MAX_COLS 16
 #define MAX_VALUE 32
+#define MAX_DEF_TEXT 128
 #define MAX_ROWS 256
 #define MAX_TABLES 32
 #define MAX_INDEXES 4
+#define MAX_FKS 4
+#define MAX_DEFS (MAX_COLS + MAX_FKS + 1)
 #define MAX_STATEMENT 2048
 #define KV_KEY 64
 #define KV_DATA 960
@@ -42,11 +45,15 @@ struct TableDef {
     int col_count;
     int pk_col;
     int index_count;
+    int fk_count;
     char cols[MAX_COLS][MAX_NAME + 1];
     int col_types[MAX_COLS];
     int col_lens[MAX_COLS];
     char index_names[MAX_INDEXES][MAX_NAME + 1];
     int index_cols[MAX_INDEXES];
+    int fk_cols[MAX_FKS];
+    char fk_tables[MAX_FKS][MAX_NAME + 1];
+    char fk_ref_cols[MAX_FKS][MAX_NAME + 1];
 };
 
 struct Row {
@@ -503,7 +510,7 @@ static char *find_i(char *s, const char *needle)
     return NULL;
 }
 
-static void clean_token(char *s)
+static void clean_token_max(char *s, int max)
 {
     char *t = trim(s);
     int len;
@@ -515,7 +522,12 @@ static void clean_token(char *s)
         memmove(s, s + 1, len - 2);
         s[len - 2] = '\0';
     }
-    upper_copy(s, s, MAX_VALUE + 1);
+    upper_copy(s, s, max);
+}
+
+static void clean_token(char *s)
+{
+    clean_token_max(s, MAX_VALUE + 1);
 }
 
 static int valid_name(const char *s)
@@ -802,8 +814,8 @@ static int where_simple_eq(struct WhereExpr *expr, int *col, char *value)
     return 1;
 }
 
-static int parse_csv(char *text, char values[MAX_COLS][MAX_VALUE + 1],
-                     int *count)
+static int parse_csv_limit(char *text, char values[][MAX_VALUE + 1],
+                           int *count, int limit)
 {
     int n = 0;
     char *p = text;
@@ -816,7 +828,7 @@ static int parse_csv(char *text, char values[MAX_COLS][MAX_VALUE + 1],
         }
         if ((*p == ',' && !in_quote) || *p == '\0') {
             char save = *p;
-            if (n >= MAX_COLS) {
+            if (n >= limit) {
                 return 0;
             }
             *p = '\0';
@@ -832,6 +844,50 @@ static int parse_csv(char *text, char values[MAX_COLS][MAX_VALUE + 1],
         p++;
     }
 
+    *count = n;
+    return 1;
+}
+
+static int parse_csv(char *text, char values[MAX_COLS][MAX_VALUE + 1],
+                     int *count)
+{
+    return parse_csv_limit(text, values, count, MAX_COLS);
+}
+
+static int parse_def_csv(char *text, char values[MAX_DEFS][MAX_DEF_TEXT + 1],
+                         int *count)
+{
+    int n = 0;
+    char *p = text;
+    char *start = text;
+    int in_quote = 0;
+    int paren = 0;
+
+    while (1) {
+        if (*p == '\'') {
+            in_quote = !in_quote;
+        } else if (*p == '(' && !in_quote) {
+            paren++;
+        } else if (*p == ')' && !in_quote && paren > 0) {
+            paren--;
+        }
+        if ((*p == ',' && !in_quote && paren == 0) || *p == '\0') {
+            char save = *p;
+            if (n >= MAX_DEFS) {
+                return 0;
+            }
+            *p = '\0';
+            strncpy(values[n], start, MAX_DEF_TEXT);
+            values[n][MAX_DEF_TEXT] = '\0';
+            clean_token_max(values[n], MAX_DEF_TEXT + 1);
+            n++;
+            if (save == '\0') {
+                break;
+            }
+            start = p + 1;
+        }
+        p++;
+    }
     *count = n;
     return 1;
 }
@@ -860,6 +916,7 @@ static int decode_table_def(struct TableDef *table, const char *data)
     table->name[MAX_NAME] = '\0';
     table->pk_col = -1;
     table->index_count = 0;
+    table->fk_count = 0;
     pk_name[0] = '\0';
     while ((tok = strtok(NULL, "|")) != NULL) {
         if (starts_i(tok, "PK=")) {
@@ -898,6 +955,49 @@ static int decode_table_def(struct TableDef *table, const char *data)
             table->index_names[table->index_count][MAX_NAME] = '\0';
             table->index_cols[table->index_count] = ixcol;
             table->index_count++;
+            continue;
+        }
+        if (starts_i(tok, "FK=")) {
+            char fkbuf[MAX_VALUE + 1];
+            char *p1;
+            char *p2;
+            int fkcol;
+
+            if (table->fk_count >= MAX_FKS) {
+                return 0;
+            }
+            strncpy(fkbuf, tok + 3, MAX_VALUE);
+            fkbuf[MAX_VALUE] = '\0';
+            rtrim(fkbuf);
+            p1 = strchr(fkbuf, ':');
+            if (p1 == NULL) {
+                return 0;
+            }
+            *p1++ = '\0';
+            p2 = strchr(p1, ':');
+            if (p2 == NULL) {
+                return 0;
+            }
+            *p2++ = '\0';
+            clean_token(fkbuf);
+            clean_token(p1);
+            clean_token(p2);
+            fkcol = -1;
+            for (i = 0; i < c; i++) {
+                if (eqi(table->cols[i], fkbuf)) {
+                    fkcol = i;
+                    break;
+                }
+            }
+            if (fkcol < 0 || !valid_name(p1) || !valid_name(p2)) {
+                return 0;
+            }
+            table->fk_cols[table->fk_count] = fkcol;
+            strncpy(table->fk_tables[table->fk_count], p1, MAX_NAME);
+            table->fk_tables[table->fk_count][MAX_NAME] = '\0';
+            strncpy(table->fk_ref_cols[table->fk_count], p2, MAX_NAME);
+            table->fk_ref_cols[table->fk_count][MAX_NAME] = '\0';
+            table->fk_count++;
             continue;
         }
         if (c >= MAX_COLS) {
@@ -1022,6 +1122,20 @@ static int save_catalog(struct TableDef tables[], int count)
             strcat(data, tables[i].index_names[c]);
             strcat(data, ":");
             strcat(data, tables[i].cols[tables[i].index_cols[c]]);
+        }
+        for (c = 0; c < tables[i].fk_count; c++) {
+            if ((int)strlen(data) + 5 +
+                (int)strlen(tables[i].cols[tables[i].fk_cols[c]]) +
+                (int)strlen(tables[i].fk_tables[c]) +
+                (int)strlen(tables[i].fk_ref_cols[c]) > KV_DATA) {
+                return 0;
+            }
+            strcat(data, "|FK=");
+            strcat(data, tables[i].cols[tables[i].fk_cols[c]]);
+            strcat(data, ":");
+            strcat(data, tables[i].fk_tables[c]);
+            strcat(data, ":");
+            strcat(data, tables[i].fk_ref_cols[c]);
         }
         if (!kv_put(key, data)) {
             return 0;
@@ -1280,6 +1394,86 @@ static int save_rows(struct TableDef *t, struct Row rows[], int row_count)
     return 1;
 }
 
+static int fk_value_exists(struct TableDef tables[], int count,
+                           struct TableDef *child, int fk_no,
+                           const char *value)
+{
+    int parent;
+    int ref_col;
+    int r;
+    int found;
+    struct Row row;
+
+    parent = find_table(tables, count, child->fk_tables[fk_no]);
+    if (parent < 0) {
+        return 0;
+    }
+    ref_col = find_col(&tables[parent], child->fk_ref_cols[fk_no]);
+    if (ref_col < 0 || tables[parent].pk_col != ref_col) {
+        return 0;
+    }
+    for (r = 1; r <= MAX_ROWS; r++) {
+        if (!load_row_slot(&tables[parent], r, &row, &found)) {
+            return 0;
+        }
+        if (found && eqi(row.values[ref_col], value)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int check_foreign_keys(struct TableDef tables[], int count,
+                              struct TableDef *table,
+                              char values[][MAX_VALUE + 1])
+{
+    int i;
+
+    for (i = 0; i < table->fk_count; i++) {
+        if (values[table->fk_cols[i]][0] == '\0' ||
+            !fk_value_exists(tables, count, table, i,
+                             values[table->fk_cols[i]])) {
+            printf("ERR FOREIGN KEY NOT FOUND\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int row_is_referenced(struct TableDef tables[], int count,
+                             struct TableDef *parent, const char *value)
+{
+    int t;
+    int f;
+
+    if (parent->pk_col < 0) {
+        return 0;
+    }
+    for (t = 0; t < count; t++) {
+        for (f = 0; f < tables[t].fk_count; f++) {
+            int r;
+            int found;
+            struct Row row;
+
+            if (!eqi(tables[t].fk_tables[f], parent->name) ||
+                !eqi(tables[t].fk_ref_cols[f],
+                     parent->cols[parent->pk_col])) {
+                continue;
+            }
+            for (r = 1; r <= MAX_ROWS; r++) {
+                if (!load_row_slot(&tables[t], r, &row, &found)) {
+                    return 1;
+                }
+                if (found &&
+                    eqi(row.values[tables[t].fk_cols[f]], value)) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static void print_select_line(struct TableDef *t, struct Row *row, int header)
 {
     char line[MAX_LINE];
@@ -1345,6 +1539,11 @@ static void cmd_schema(struct TableDef tables[], int count, char *sql)
         printf("INDEX %s ON %s(%s)\n", tables[idx].index_names[c],
                tables[idx].name, tables[idx].cols[tables[idx].index_cols[c]]);
     }
+    for (c = 0; c < tables[idx].fk_count; c++) {
+        printf("FOREIGN KEY %s REFERENCES %s(%s)\n",
+               tables[idx].cols[tables[idx].fk_cols[c]],
+               tables[idx].fk_tables[c], tables[idx].fk_ref_cols[c]);
+    }
 }
 
 static void cmd_create(struct TableDef tables[], int *count, char *sql)
@@ -1352,11 +1551,16 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
     char *p;
     char *q;
     char name[MAX_NAME + 1];
-    char vals[MAX_COLS][MAX_VALUE + 1];
+    char vals[MAX_DEFS][MAX_DEF_TEXT + 1];
     char pk_name[MAX_NAME + 1];
     int col_count = 0;
     int actual_cols = 0;
     int pk_col = -1;
+    int fk_cols[MAX_FKS];
+    char fk_col_names[MAX_FKS][MAX_NAME + 1];
+    char fk_tables[MAX_FKS][MAX_NAME + 1];
+    char fk_ref_cols[MAX_FKS][MAX_NAME + 1];
+    int fk_count = 0;
     int i;
 
     p = sql + strlen("CREATE TABLE");
@@ -1384,7 +1588,7 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
         return;
     }
     *q = '\0';
-    if (!parse_csv(p + 1, vals, &col_count) || col_count < 1) {
+    if (!parse_def_csv(p + 1, vals, &col_count) || col_count < 1) {
         printf("ERR BAD COLUMN LIST\n");
         return;
     }
@@ -1412,6 +1616,63 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
             strncpy(pk_name, open + 1, MAX_NAME);
             pk_name[MAX_NAME] = '\0';
             clean_token(pk_name);
+            continue;
+        }
+        if (starts_i(vals[i], "FOREIGN KEY")) {
+            char *open = strchr(vals[i], '(');
+            char *close = strchr(vals[i], ')');
+            char *ref;
+            char *ropen;
+            char *rclose;
+            char fk_col_name[MAX_NAME + 1];
+
+            if (fk_count >= MAX_FKS || open == NULL || close == NULL ||
+                close <= open + 1) {
+                printf("ERR BAD FOREIGN KEY\n");
+                return;
+            }
+            *close = '\0';
+            strncpy(fk_col_name, open + 1, MAX_NAME);
+            fk_col_name[MAX_NAME] = '\0';
+            clean_token(fk_col_name);
+            ref = find_i(close + 1, "REFERENCES");
+            if (ref == NULL) {
+                printf("ERR BAD FOREIGN KEY\n");
+                return;
+            }
+            ref += strlen("REFERENCES");
+            ref = ltrim(ref);
+            q = ref;
+            while (*q && (isalnum((unsigned char)*q) || *q == '_')) {
+                q++;
+            }
+            if (q - ref > MAX_NAME) {
+                printf("ERR BAD FOREIGN KEY\n");
+                return;
+            }
+            strncpy(fk_tables[fk_count], ref, q - ref);
+            fk_tables[fk_count][q - ref] = '\0';
+            clean_token(fk_tables[fk_count]);
+            ropen = strchr(q, '(');
+            rclose = strrchr(q, ')');
+            if (ropen == NULL || rclose == NULL || rclose <= ropen + 1) {
+                printf("ERR BAD FOREIGN KEY\n");
+                return;
+            }
+            *rclose = '\0';
+            strncpy(fk_ref_cols[fk_count], ropen + 1, MAX_NAME);
+            fk_ref_cols[fk_count][MAX_NAME] = '\0';
+            clean_token(fk_ref_cols[fk_count]);
+            fk_cols[fk_count] = -1;
+            if (!valid_name(fk_col_name) ||
+                !valid_name(fk_tables[fk_count]) ||
+                !valid_name(fk_ref_cols[fk_count])) {
+                printf("ERR BAD FOREIGN KEY\n");
+                return;
+            }
+            strncpy(fk_col_names[fk_count], fk_col_name, MAX_NAME);
+            fk_col_names[fk_count][MAX_NAME] = '\0';
+            fk_count++;
             continue;
         }
 
@@ -1468,12 +1729,52 @@ static void cmd_create(struct TableDef tables[], int *count, char *sql)
         printf("ERR BAD PRIMARY KEY\n");
         return;
     }
+    for (i = 0; i < fk_count; i++) {
+        int parent;
+        int ref_col;
+        int c2;
+
+        fk_cols[i] = -1;
+        for (c2 = 0; c2 < actual_cols; c2++) {
+            if (eqi(tables[*count].cols[c2], fk_col_names[i])) {
+                fk_cols[i] = c2;
+                break;
+            }
+        }
+        if (fk_cols[i] < 0) {
+            printf("ERR BAD FOREIGN KEY\n");
+            return;
+        }
+        parent = find_table(tables, *count, fk_tables[i]);
+        if (parent < 0) {
+            printf("ERR FOREIGN TABLE NOT FOUND\n");
+            return;
+        }
+        ref_col = find_col(&tables[parent], fk_ref_cols[i]);
+        if (ref_col < 0 || tables[parent].pk_col != ref_col) {
+            printf("ERR FOREIGN KEY NOT PRIMARY\n");
+            return;
+        }
+        if (tables[*count].col_types[fk_cols[i]] !=
+            tables[parent].col_types[ref_col]) {
+            printf("ERR FOREIGN KEY TYPE\n");
+            return;
+        }
+    }
 
     strncpy(tables[*count].name, name, MAX_NAME);
     tables[*count].name[MAX_NAME] = '\0';
     tables[*count].col_count = actual_cols;
     tables[*count].pk_col = pk_col;
     tables[*count].index_count = 0;
+    tables[*count].fk_count = fk_count;
+    for (i = 0; i < fk_count; i++) {
+        tables[*count].fk_cols[i] = fk_cols[i];
+        strncpy(tables[*count].fk_tables[i], fk_tables[i], MAX_NAME);
+        tables[*count].fk_tables[i][MAX_NAME] = '\0';
+        strncpy(tables[*count].fk_ref_cols[i], fk_ref_cols[i], MAX_NAME);
+        tables[*count].fk_ref_cols[i][MAX_NAME] = '\0';
+    }
     (*count)++;
     if (!save_catalog(tables, *count)) {
         printf("ERR CANNOT WRITE CATALOG\n");
@@ -1496,7 +1797,6 @@ static void cmd_create_index(struct TableDef tables[], int count, char *sql)
     int cidx;
     int row_count = 0;
     struct Row rows[MAX_ROWS];
-
     p = sql + strlen("CREATE INDEX");
     p = ltrim(p);
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
@@ -1583,7 +1883,6 @@ static void cmd_insert(struct TableDef tables[], int count, char *sql)
     int i;
     int row_count = 0;
     struct Row rows[MAX_ROWS];
-
     p = sql + strlen("INSERT INTO");
     p = ltrim(p);
     i = 0;
@@ -1640,6 +1939,9 @@ static void cmd_insert(struct TableDef tables[], int count, char *sql)
             return;
         }
     }
+    if (!check_foreign_keys(tables, count, &tables[idx], vals)) {
+        return;
+    }
     for (i = 0; i < val_count; i++) {
         strncpy(rows[row_count].values[i], vals[i], MAX_VALUE);
         rows[row_count].values[i][MAX_VALUE] = '\0';
@@ -1666,7 +1968,6 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     char where_val[MAX_VALUE + 1];
     struct WhereExpr expr;
     struct Row rows[MAX_ROWS];
-
     if (!starts_i(sql, "SELECT * FROM")) {
         printf("ERR ONLY SELECT * FROM table IS SUPPORTED\n");
         return;
@@ -1913,7 +2214,6 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
     struct WhereExpr expr;
     struct Row rows[MAX_ROWS];
     struct Row out[MAX_ROWS];
-
     p = sql + strlen("DELETE FROM");
     p = ltrim(p);
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
@@ -1939,6 +2239,12 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
     }
     for (r = 0; r < row_count; r++) {
         if (where_match(&tables[idx], &rows[r], &expr)) {
+            if (tables[idx].pk_col >= 0 &&
+                row_is_referenced(tables, count, &tables[idx],
+                                  rows[r].values[tables[idx].pk_col])) {
+                printf("ERR ROW REFERENCED\n");
+                return;
+            }
             deleted++;
         } else {
             out[kept++] = rows[r];
@@ -1968,7 +2274,6 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
     int changed = 0;
     int row_count = 0;
     struct Row rows[MAX_ROWS];
-
     p = sql + strlen("UPDATE");
     p = ltrim(p);
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
@@ -2031,6 +2336,10 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
         if (where_match(&tables[idx], &rows[r], &expr)) {
             strncpy(rows[r].values[set_col], set_val, MAX_VALUE);
             rows[r].values[set_col][MAX_VALUE] = '\0';
+            if (!check_foreign_keys(tables, count, &tables[idx],
+                                    rows[r].values)) {
+                return;
+            }
             changed++;
         }
     }
@@ -2056,6 +2365,19 @@ static void cmd_drop(struct TableDef tables[], int *count, char *sql)
     if (idx < 0) {
         printf("ERR TABLE NOT FOUND\n");
         return;
+    }
+    for (i = 0; i < *count; i++) {
+        int f;
+
+        if (i == idx) {
+            continue;
+        }
+        for (f = 0; f < tables[i].fk_count; f++) {
+            if (eqi(tables[i].fk_tables[f], tables[idx].name)) {
+                printf("ERR TABLE REFERENCED\n");
+                return;
+            }
+        }
     }
     kv_make_key(key, "T", tables[idx].name, -1);
     if (!kv_delete(key)) {
@@ -2092,6 +2414,7 @@ static void cmd_help(void)
     printf("  CREATE TABLE name (id INT PRIMARY KEY, name VARCHAR(16));\n");
     printf("  CREATE TABLE name (id PRIMARY KEY, col2, ...);\n");
     printf("  CREATE TABLE name (id, col2, PRIMARY KEY (id));\n");
+    printf("  FOREIGN KEY (col) REFERENCES parent(pkcol)\n");
     printf("  CREATE INDEX idx ON name (col);\n");
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
     printf("  SELECT * FROM name [WHERE expression];\n");

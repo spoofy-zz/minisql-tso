@@ -21,6 +21,9 @@ CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
 SELECT * FROM PEOPLE WHERE ID BETWEEN 1 AND 3;
 SELECT * FROM PEOPLE WHERE NAME LIKE 'A%' OR CITY='RIJEKA';
+CREATE TABLE ORDERS (OID INT PRIMARY KEY, PERSON_ID INT,
+ITEM VARCHAR(8), FOREIGN KEY (PERSON_ID) REFERENCES PEOPLE(ID));
+INSERT INTO ORDERS VALUES (100, 1, 'BOOK');
 UPDATE PEOPLE SET CITY='RIJEKA' WHERE ID=1;
 DELETE FROM PEOPLE WHERE ID=1;
 DROP TABLE PEOPLE;
@@ -229,6 +232,9 @@ The standard batch test is `jcl/MINISQL.jcl`. The job:
 - tests `SELECT * FROM PEOPLE`
 - tests `SELECT * FROM PEOPLE WHERE CITY='RIJEKA'`
 - tests `WHERE` expressions with `AND`, `OR`, `LIKE`, `<`, `>` and `BETWEEN`
+- creates `ORDERS` with a single-column foreign key to `PEOPLE(ID)`
+- tests valid and invalid foreign key inserts
+- tests delete protection for referenced parent rows
 - tests `UPDATE` and `DELETE`
 
 First reset the VSAM database if you want a clean test:
@@ -293,6 +299,8 @@ ERR BAD INT VALUE
 ERR VALUE TOO LONG
 OK INDEX CREATED
 INDEX IDXCITY ON PEOPLE(CITY)
+FOREIGN KEY PERSON_ID REFERENCES PEOPLE(ID)
+ERR FOREIGN KEY NOT FOUND
 ID | NAME | CITY | AGE | EMAIL
 2 | IVO | RIJEKA | 41 | IVO@EX
 OK 1 ROWS
@@ -329,6 +337,10 @@ SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
 INSERT INTO PEOPLE VALUES (3, 'PERO', 'RIJEKA', 22, 'PERO@EX');
 INSERT INTO PEOPLE VALUES ('ABC', 'PERO', 'RIJEKA', 22, 'PERO@EX');
 INSERT INTO PEOPLE VALUES (4, 'PREDUGOIME', 'RIJEKA', 22, 'LONG@EX');
+CREATE TABLE ORDERS (OID INT PRIMARY KEY, PERSON_ID INT,
+ITEM VARCHAR(8), FOREIGN KEY (PERSON_ID) REFERENCES PEOPLE(ID));
+INSERT INTO ORDERS VALUES (100, 3, 'BOOK');
+INSERT INTO ORDERS VALUES (101, 99, 'BAD');
 SELECT * FROM PEOPLE WHERE ID > 1 AND CITY LIKE 'RI%';
 SELECT * FROM PEOPLE WHERE ID BETWEEN 1 AND 3;
 SELECT * FROM PEOPLE WHERE NAME LIKE 'P%' OR CITY='SPLIT';
@@ -346,6 +358,7 @@ Expected behavior:
 - `.SCHEMA PEOPLE` shows `ID PRIMARY KEY` and `INDEX IDXCITY ON PEOPLE(CITY)`.
 - `SELECT ... WHERE CITY='RIJEKA'` uses the secondary index when available.
 - `WHERE` supports `AND`, `OR`, `LIKE`, `<`, `>` and `BETWEEN`.
+- single-column foreign keys validate child values against parent primary keys.
 - `ID` accepts only whole numbers because it is `INT`.
 - `NAME` accepts at most 8 characters because it is `VARCHAR(8)`.
 - duplicate `ID=3` returns `ERR DUPLICATE PRIMARY KEY`.
@@ -430,13 +443,17 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
   supported.
 - Values are normalized and stored uppercase. Quotes are used only for parsing
   values containing spaces or for clearer SQL syntax.
-- There is no `NULL`, default values, constraints except one primary key,
-  foreign keys, or check constraints.
+- There is no `NULL`, default values, check constraints, or constraints beyond
+  one primary key and single-column foreign keys.
 - Maximum 32 tables.
 - Maximum 16 columns per table.
 - Maximum 256 rows per table.
 - Maximum 4 secondary indexes per table.
 - `PRIMARY KEY` supports one column only.
+- A table may define up to 4 single-column foreign keys.
+- Foreign keys must reference the primary key column of an existing table.
+- Foreign keys reject invalid child inserts/updates and referenced parent
+  deletes. There is no cascade update/delete.
 - `CREATE INDEX` supports one column per index.
 - Table, column, and index names may have at most 16 characters.
 - One column value may have at most 32 characters.
