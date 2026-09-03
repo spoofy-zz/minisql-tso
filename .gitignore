@@ -1,3 +1,4 @@
+.env
 .mbt/
 build/
 minisql

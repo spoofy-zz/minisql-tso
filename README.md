@@ -51,8 +51,11 @@ Files:
 - `asm/msqtput.asm` - C-callable TSO `TPUT` wrapper for normal TSO output.
 - `clist/MSQL.clist` - TSO CLIST that allocates `MINIKV`, starts `MSQLTSO`,
   and frees the DD after exit.
+- `.env.example` - sample local MVS target configuration.
 - `Makefile` - includes the local `mbt/mk/mbt.mk`.
 - `project.toml` - MBT project definition and deploy target.
+- `tools/deploy-mvs.sh` - `.env` driven deploy wrapper that uploads load
+  modules, source/JCL members, README, and `SYS2.CMDPROC(MSQL)`.
 - `jcl/COMPILE.jcl` - receives the MBT XMIT package into the load library.
 - `jcl/ALLOCVS.jcl` - creates and initializes `IBMUSER.MINISQL.KV`.
 - `jcl/MINISQL.jcl` - batch SQL test using `SYSIN`.
@@ -86,6 +89,67 @@ Expected output:
 build/minisql.deploy.xmit
 ```
 
+## Configure MVS Deploy Target
+
+Copy the example environment file and edit it for the target MVS host:
+
+```bash
+cp .env.example .env
+```
+
+Important variables:
+
+```text
+MINISQL_TOOLCHAIN_BIN=/home/bnovak/.local/bin
+
+MBT_MVS_HOST=192.168.178.76
+MBT_MVS_PORT=1080
+MBT_MVS_USER=RVEZ001
+MBT_MVS_PASS=CHANGEME
+MBT_MVS_HLQ=IBMUSER
+MBT_MVS_PROTOCOL=http
+MBT_MVS_REJECT_UNAUTHORIZED=false
+
+MINISQL_PDS=IBMUSER.MINISQL
+MINISQL_LOADLIB=IBMUSER.MINISQL.LOAD
+MINISQL_XMIT_IN=IBMUSER.MBT.XMIT.IN
+MINISQL_LOAD_VOLUME=TSO003
+MINISQL_CMDPROC=SYS2.CMDPROC
+```
+
+`MINISQL_TOOLCHAIN_BIN` is prepended to `PATH` by the Makefile. Set it to the
+directory that contains `cc370`, `as370`, `ld370`, and `ar370`.
+If it is not set and `$(HOME)/.local/bin/cc370` exists, the Makefile uses
+`$(HOME)/.local/bin` automatically.
+
+`make deploy-mvs` reads `.env`, runs the mbt load module deploy to
+`MINISQL_LOADLIB` through `MINISQL_XMIT_IN`, uploads the project members to
+`MINISQL_PDS`, and uploads the TSO launcher CLIST to
+`MINISQL_CMDPROC(MSQL)`.
+
+Dry-run:
+
+```bash
+make deploy-mvs-dry-run
+```
+
+Live deploy:
+
+```bash
+make deploy-mvs
+```
+
+For a one-off run with another environment file:
+
+```bash
+MINISQL_ENV_FILE=.env.tk5 make deploy-mvs-dry-run
+MINISQL_ENV_FILE=.env.tk5 make deploy-mvs
+```
+
+If a target uses HTTPS, set `MBT_MVS_PROTOCOL=https` and the HTTPS port in
+`.env`. The endpoint must expose z/OSMF-compatible REST paths under `/zosmf`;
+otherwise both mbt and Zowe commands will fail with HTTP 404.
+
 ## Prepare The MVS PDS
 
 If the PDS does not exist yet, create it with Zowe:
@@ -102,7 +166,9 @@ zowe zos-files create data-set-partitioned IBMUSER.MINISQL \
   --zosmf-profile hercules
 ```
 
-Upload source and JCL members:
+`make deploy-mvs` uploads the source and JCL members automatically. If you
+need to do it manually, use commands like these with the target host/profile
+from your environment:
 
 ```bash
 zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(MINISQL)" \
@@ -133,7 +199,8 @@ List PDS members:
 zowe zos-files list all-members IBMUSER.MINISQL --zosmf-profile hercules
 ```
 
-Upload the TSO launcher CLIST:
+`make deploy-mvs` also uploads the TSO launcher CLIST automatically. Manual
+upload example:
 
 ```bash
 zowe zos-files upload file-to-data-set clist/MSQL.clist \
@@ -141,9 +208,11 @@ zowe zos-files upload file-to-data-set clist/MSQL.clist \
   --zosmf-profile hercules
 ```
 
-## Deploy Load Modules
+## Manual Load Module Deploy
 
-After `make deploy ARGS=--dry-run VERBOSE=1`, upload the XMIT package to the
+Normally use `make deploy-mvs`, which reads `.env` and transfers the CLIST as
+part of the deploy. For a manual load-module-only deploy, run
+`make deploy ARGS=--dry-run VERBOSE=1`, then upload the XMIT package to the
 staging data set:
 
 ```bash
