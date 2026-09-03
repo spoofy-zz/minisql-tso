@@ -467,6 +467,8 @@ static int line_starts_command(const char *s)
            starts_i(s, "HELP") ||
            starts_i(s, ".TABLES") ||
            starts_i(s, ".SCHEMA") ||
+           starts_i(s, "DESC") ||
+           starts_i(s, "DESCRIBE") ||
            starts_i(s, "CREATE TABLE") ||
            starts_i(s, "CREATE INDEX") ||
            starts_i(s, "INSERT INTO") ||
@@ -1514,6 +1516,92 @@ static void print_select_line(struct TableDef *t, struct Row *row, int header)
     printf("%s\n", line);
 }
 
+static int is_count_expr(const char *s)
+{
+    return eqi(s, "COUNT") || eqi(s, "COUNT()") || eqi(s, "COUNT(*)");
+}
+
+static char *find_keyword(char *s, const char *keyword)
+{
+    int n = (int)strlen(keyword);
+    char *p;
+
+    for (p = s; *p != '\0'; p++) {
+        int before = p == s || !isalnum((unsigned char)p[-1]);
+        int after;
+
+        if (ncmp_i(p, keyword, n) != 0) {
+            continue;
+        }
+        after = p[n] == '\0' || !isalnum((unsigned char)p[n]);
+        if (before && after) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static void print_projected_line(struct TableDef *t, struct Row *row,
+                                 int cols[], int col_count, int header)
+{
+    char line[MAX_LINE];
+    int i;
+
+    line[0] = '\0';
+    for (i = 0; i < col_count; i++) {
+        if (i > 0) {
+            strcat(line, " | ");
+        }
+        if (header) {
+            strcat(line, t->cols[cols[i]]);
+        } else {
+            strcat(line, row->values[cols[i]]);
+        }
+    }
+    printf("%s\n", line);
+}
+
+static int parse_select_list(struct TableDef *t, char *text, int cols[],
+                             int *col_count, int *select_all,
+                             int *select_count)
+{
+    char vals[MAX_COLS][MAX_VALUE + 1];
+    int val_count = 0;
+    int i;
+
+    *col_count = 0;
+    *select_all = 0;
+    *select_count = 0;
+    clean_token_max(text, MAX_STATEMENT);
+    if (eqi(text, "*")) {
+        *select_all = 1;
+        return 1;
+    }
+    if (is_count_expr(text)) {
+        *select_count = 1;
+        return 1;
+    }
+    if (!parse_csv_limit(text, vals, &val_count, MAX_COLS) ||
+        val_count < 1) {
+        return 0;
+    }
+    for (i = 0; i < val_count; i++) {
+        int c;
+
+        if (is_count_expr(vals[i])) {
+            *select_count = 1;
+            continue;
+        }
+        c = find_col(t, vals[i]);
+        if (c < 0) {
+            return 0;
+        }
+        cols[*col_count] = c;
+        (*col_count)++;
+    }
+    return *col_count > 0 || *select_count;
+}
+
 static int cmp_row_qsort(const void *a, const void *b)
 {
     const struct Row *ra = (const struct Row *)a;
@@ -1696,6 +1784,60 @@ static void cmd_schema(struct TableDef tables[], int count, char *sql)
                tables[idx].cols[tables[idx].fk_cols[c]],
                tables[idx].fk_tables[c], tables[idx].fk_ref_cols[c]);
     }
+}
+
+static void cmd_desc(struct TableDef tables[], int count, char *sql)
+{
+    char name[MAX_NAME + 1];
+    char *prefix;
+    int idx;
+    int c;
+
+    prefix = starts_i(sql, "DESCRIBE") ? "DESCRIBE" : "DESC";
+    if (!parse_name_after(sql, prefix, name)) {
+        printf("ERR USAGE: DESC table\n");
+        return;
+    }
+    idx = find_table(tables, count, name);
+    if (idx < 0) {
+        printf("ERR TABLE NOT FOUND\n");
+        return;
+    }
+    printf("FIELD | TYPE | KEY | REF\n");
+    for (c = 0; c < tables[idx].col_count; c++) {
+        char typ[MAX_VALUE + 1];
+        char key[MAX_VALUE + 1];
+        char ref[MAX_NAME * 2 + 4];
+        int i;
+
+        type_to_text(tables[idx].col_types[c], tables[idx].col_lens[c],
+                     typ, sizeof(typ));
+        key[0] = '\0';
+        ref[0] = '\0';
+        if (tables[idx].pk_col == c) {
+            strcat(key, "PRI");
+        }
+        if (find_index_col(&tables[idx], c) >= 0) {
+            if (key[0] != '\0') {
+                strcat(key, ",");
+            }
+            strcat(key, "MUL");
+        }
+        for (i = 0; i < tables[idx].fk_count; i++) {
+            if (tables[idx].fk_cols[i] != c) {
+                continue;
+            }
+            if (key[0] != '\0') {
+                strcat(key, ",");
+            }
+            strcat(key, "FK");
+            sprintf(ref, "%s(%s)", tables[idx].fk_tables[i],
+                    tables[idx].fk_ref_cols[i]);
+            break;
+        }
+        printf("%s | %s | %s | %s\n", tables[idx].cols[c], typ, key, ref);
+    }
+    printf("OK %d COLUMNS\n", tables[idx].col_count);
 }
 
 static void cmd_create(struct TableDef tables[], int *count, char *sql)
@@ -2123,10 +2265,15 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     int order_col = -1;
     int order_count = 0;
     int order_desc = 0;
+    int select_cols[MAX_COLS];
+    int select_col_count = 0;
+    int select_all = 0;
+    int select_count = 0;
     int where_col;
     int index_no;
     char where_val[MAX_VALUE + 1];
     char col_name[MAX_NAME + 1];
+    char select_buf[MAX_STATEMENT];
     char where_buf[MAX_STATEMENT];
     char group_buf[MAX_STATEMENT];
     char order_buf[MAX_STATEMENT];
@@ -2135,11 +2282,27 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     struct Row out[MAX_ROWS];
     struct GroupRow groups[MAX_ROWS];
 
-    if (!starts_i(sql, "SELECT * FROM")) {
-        printf("ERR ONLY SELECT * FROM table IS SUPPORTED\n");
+    if (!starts_i(sql, "SELECT")) {
+        printf("ERR BAD SELECT\n");
         return;
     }
-    p = sql + strlen("SELECT * FROM");
+    p = find_keyword(sql + strlen("SELECT"), "FROM");
+    if (p == NULL) {
+        printf("ERR BAD SELECT\n");
+        return;
+    }
+    c = (int)(p - (sql + strlen("SELECT")));
+    if (c <= 0 || c >= MAX_STATEMENT) {
+        printf("ERR BAD SELECT\n");
+        return;
+    }
+    strncpy(select_buf, sql + strlen("SELECT"), c);
+    select_buf[c] = '\0';
+    if (*trim(select_buf) == '\0') {
+        printf("ERR BAD SELECT\n");
+        return;
+    }
+    p += strlen("FROM");
     p = ltrim(p);
     c = 0;
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
@@ -2152,6 +2315,11 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     idx = find_table(tables, count, name);
     if (idx < 0) {
         printf("ERR TABLE NOT FOUND\n");
+        return;
+    }
+    if (!parse_select_list(&tables[idx], select_buf, select_cols,
+                           &select_col_count, &select_all, &select_count)) {
+        printf("ERR BAD SELECT LIST\n");
         return;
     }
     p = ltrim(p);
@@ -2280,6 +2448,18 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         }
     }
     if (group_col >= 0) {
+        if (!select_all) {
+            for (r = 0; r < select_col_count; r++) {
+                if (select_cols[r] != group_col) {
+                    printf("ERR BAD SELECT LIST\n");
+                    return;
+                }
+            }
+            if (select_col_count == 0 && !select_count) {
+                printf("ERR BAD SELECT LIST\n");
+                return;
+            }
+        }
         for (r = 0; r < out_count; r++) {
             if (!add_group_row(groups, &group_count,
                                out[r].values[group_col])) {
@@ -2294,11 +2474,33 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
             g_group_sort_by_count = order_count;
             qsort(groups, group_count, sizeof(groups[0]), cmp_group_qsort);
         }
-        printf("%s | COUNT\n", tables[idx].cols[group_col]);
+        if (select_all || (select_col_count > 0 && select_count)) {
+            printf("%s | COUNT\n", tables[idx].cols[group_col]);
+        } else if (select_count) {
+            printf("COUNT\n");
+        } else {
+            printf("%s\n", tables[idx].cols[group_col]);
+        }
         for (r = 0; r < group_count; r++) {
-            printf("%s | %d\n", groups[r].value, groups[r].count);
+            if (select_all || (select_col_count > 0 && select_count)) {
+                printf("%s | %d\n", groups[r].value, groups[r].count);
+            } else if (select_count) {
+                printf("%d\n", groups[r].count);
+            } else {
+                printf("%s\n", groups[r].value);
+            }
         }
         printf("OK %d GROUPS\n", group_count);
+        return;
+    }
+    if (select_count) {
+        if (select_col_count > 0 || select_all) {
+            printf("ERR BAD SELECT LIST\n");
+            return;
+        }
+        printf("COUNT\n");
+        printf("%d\n", out_count);
+        printf("OK 1 ROWS\n");
         return;
     }
     if (order != NULL) {
@@ -2307,9 +2509,19 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         g_sort_desc = order_desc;
         qsort(out, out_count, sizeof(out[0]), cmp_row_qsort);
     }
-    print_select_line(&tables[idx], NULL, 1);
+    if (select_all) {
+        print_select_line(&tables[idx], NULL, 1);
+    } else {
+        print_projected_line(&tables[idx], NULL, select_cols,
+                             select_col_count, 1);
+    }
     for (r = 0; r < out_count; r++) {
-        print_select_line(&tables[idx], &out[r], 0);
+        if (select_all) {
+            print_select_line(&tables[idx], &out[r], 0);
+        } else {
+            print_projected_line(&tables[idx], &out[r], select_cols,
+                                 select_col_count, 0);
+        }
     }
     printf("OK %d ROWS\n", out_count);
 }
@@ -2690,7 +2902,7 @@ static void cmd_help(void)
     printf("  FOREIGN KEY (col) REFERENCES parent(pkcol)\n");
     printf("  CREATE INDEX idx ON name (col);\n");
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
-    printf("  SELECT * FROM name [WHERE expression]\n");
+    printf("  SELECT *|cols|COUNT(*) FROM name [WHERE expression]\n");
     printf("    [GROUP BY col] [ORDER BY col|COUNT [ASC|DESC]];\n");
     printf("  WHERE: =, <, >, LIKE, BETWEEN, AND, OR\n");
     printf("  GROUP BY supports one column and returns column | COUNT\n");
@@ -2699,6 +2911,7 @@ static void cmd_help(void)
     printf("  DROP TABLE name;\n");
     printf("  .TABLES\n");
     printf("  .SCHEMA name\n");
+    printf("  DESC name or DESCRIBE name\n");
     printf("  .HELP or //HELP\n");
     printf("  .QUIT\n");
 }
@@ -2730,6 +2943,8 @@ static void execute(char *sql)
         cmd_tables(tables, table_count);
     } else if (starts_i(s, ".SCHEMA")) {
         cmd_schema(tables, table_count, s);
+    } else if (starts_i(s, "DESC") || starts_i(s, "DESCRIBE")) {
+        cmd_desc(tables, table_count, s);
     } else if (starts_i(s, "CREATE TABLE")) {
         cmd_create(tables, &table_count, s);
     } else if (starts_i(s, "CREATE INDEX")) {

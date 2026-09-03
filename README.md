@@ -17,6 +17,8 @@ CREATE TABLE PEOPLE (ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8),
 AGE INT, EMAIL VARCHAR(16));
 INSERT INTO PEOPLE VALUES (1, 'ANA', 'ZAGREB', 30, 'ANA@EX');
 SELECT * FROM PEOPLE;
+SELECT COUNT(*) FROM PEOPLE;
+SELECT NAME, CITY FROM PEOPLE;
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
 SELECT * FROM PEOPLE WHERE ID BETWEEN 1 AND 3;
@@ -36,6 +38,7 @@ Utility commands:
 ```text
 .TABLES
 .SCHEMA PEOPLE
+DESC PEOPLE
 .HELP
 .QUIT
 ```
@@ -205,6 +208,8 @@ AGE INT, EMAIL VARCHAR(16));
 INSERT INTO PEOPLE VALUES (1, 'ANA', 'ZAGREB', 30, 'ANA@EX');
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE;
+SELECT COUNT(*) FROM PEOPLE;
+SELECT NAME, CITY FROM PEOPLE;
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
 SELECT * FROM PEOPLE WHERE ID > 0 AND NAME LIKE 'A%';
 SELECT * FROM PEOPLE ORDER BY AGE DESC;
@@ -234,7 +239,10 @@ The standard batch test is `jcl/MINISQL.jcl`. The job:
 - tests `INT` validation and `VARCHAR` length validation
 - creates secondary index `IDXCITY` on column `CITY`
 - prints `.SCHEMA PEOPLE`
+- tests `DESC PEOPLE` and `DESCRIBE ORDERS`
 - tests `SELECT * FROM PEOPLE`
+- tests `SELECT COUNT(*) FROM PEOPLE`
+- tests selected-column output such as `SELECT NAME,CITY FROM PEOPLE`
 - tests `SELECT * FROM PEOPLE WHERE CITY='RIJEKA'`
 - tests `WHERE` expressions with `AND`, `OR`, `LIKE`, `<`, `>` and `BETWEEN`
 - tests `ORDER BY` on one column
@@ -343,13 +351,17 @@ Interactive test:
 ```sql
 .TABLES
 .SCHEMA PEOPLE
+DESC PEOPLE
 SELECT * FROM PEOPLE;
+SELECT COUNT(*) FROM PEOPLE;
+SELECT NAME,CITY FROM PEOPLE;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
 INSERT INTO PEOPLE VALUES (3, 'PERO', 'RIJEKA', 22, 'PERO@EX');
 INSERT INTO PEOPLE VALUES ('ABC', 'PERO', 'RIJEKA', 22, 'PERO@EX');
 INSERT INTO PEOPLE VALUES (4, 'PREDUGOIME', 'RIJEKA', 22, 'LONG@EX');
 CREATE TABLE ORDERS (OID INT PRIMARY KEY, PERSON_ID INT,
 ITEM VARCHAR(8), FOREIGN KEY (PERSON_ID) REFERENCES PEOPLE(ID));
+DESCRIBE ORDERS
 INSERT INTO ORDERS VALUES (100, 3, 'BOOK');
 INSERT INTO ORDERS VALUES (101, 99, 'BAD');
 SELECT * FROM PEOPLE WHERE ID > 1 AND CITY LIKE 'RI%';
@@ -477,8 +489,8 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - VSAM record layout is fixed: 64-byte key, 960-byte data, 1024 bytes total.
   If this layout changes, recreate `IBMUSER.MINISQL.KV` with
   `jcl/ALLOCVS.jcl`.
-- Only `SELECT * FROM table` is supported, with optional `WHERE`, `GROUP BY`
-  and `ORDER BY` clauses.
+- `SELECT` supports `*`, a comma-separated column list, or `COUNT(*)`.
+- `SELECT` supports optional `WHERE`, `GROUP BY` and `ORDER BY` clauses.
 - `WHERE` supports `=`, `<`, `>`, `LIKE`, `BETWEEN`, `AND` and `OR`.
 - `WHERE` does not support parentheses, `NOT`, `<=`, `>=`, `<>`, `!=`, `IN`,
   `IS NULL`, or functions.
@@ -486,6 +498,10 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - `ORDER BY` supports one table column with optional `ASC` or `DESC`.
 - `GROUP BY` supports one table column and returns that column plus `COUNT`.
 - Grouped `ORDER BY` supports the grouped column or `COUNT`.
+- `COUNT(*)` supports an optional `WHERE`; with `GROUP BY`, it counts each
+  group.
+- `DESC table` and `DESCRIBE table` show columns, data types, key roles and
+  foreign key references.
 - A secondary index is used only for `SELECT * FROM table WHERE col=value`
   when an index exists on `col` and no `GROUP BY` or `ORDER BY` is used;
   complex `WHERE` expressions use a linear scan.
