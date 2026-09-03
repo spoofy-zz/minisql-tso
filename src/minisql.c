@@ -73,6 +73,11 @@ struct WhereExpr {
     struct WhereCond conds[MAX_CONDS];
 };
 
+struct GroupRow {
+    char value[MAX_VALUE + 1];
+    int count;
+};
+
 struct KvRec {
     char key[KV_KEY];
     char data[KV_DATA];
@@ -82,6 +87,10 @@ static void rtrim(char *s);
 static int parse_where(struct TableDef *t, char *where_text,
                        struct WhereExpr *expr);
 static int validate_value(struct TableDef *t, int col, const char *value);
+static struct TableDef *g_sort_table = NULL;
+static int g_sort_col = -1;
+static int g_sort_desc = 0;
+static int g_group_sort_by_count = 0;
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
 static char g_tso_out[MAX_LINE];
@@ -1505,6 +1514,137 @@ static void print_select_line(struct TableDef *t, struct Row *row, int header)
     printf("%s\n", line);
 }
 
+static int cmp_row_qsort(const void *a, const void *b)
+{
+    const struct Row *ra = (const struct Row *)a;
+    const struct Row *rb = (const struct Row *)b;
+    int rc = cmp_value(g_sort_table, g_sort_col,
+                       ra->values[g_sort_col], rb->values[g_sort_col]);
+
+    return g_sort_desc ? -rc : rc;
+}
+
+static int cmp_group_qsort(const void *a, const void *b)
+{
+    const struct GroupRow *ga = (const struct GroupRow *)a;
+    const struct GroupRow *gb = (const struct GroupRow *)b;
+    int rc;
+
+    if (g_group_sort_by_count) {
+        if (ga->count < gb->count) {
+            rc = -1;
+        } else if (ga->count > gb->count) {
+            rc = 1;
+        } else {
+            rc = 0;
+        }
+    } else {
+        rc = cmp_value(g_sort_table, g_sort_col, ga->value, gb->value);
+    }
+    return g_sort_desc ? -rc : rc;
+}
+
+static char *next_select_clause(char *where, char *group, char *order)
+{
+    char *next = NULL;
+
+    if (where != NULL) {
+        next = where;
+    }
+    if (group != NULL && (next == NULL || group < next)) {
+        next = group;
+    }
+    if (order != NULL && (next == NULL || order < next)) {
+        next = order;
+    }
+    return next;
+}
+
+static int parse_select_col_clause(char *text, const char *keyword,
+                                   char *col_name)
+{
+    char *p = ltrim(text + strlen(keyword));
+    int i = 0;
+
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            col_name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    col_name[i] = '\0';
+    p = ltrim(p);
+    return valid_name(col_name) && *p == '\0';
+}
+
+static int parse_order_clause(struct TableDef *t, char *text, int group_col,
+                              int *order_col, int *order_count, int *desc)
+{
+    char *p = ltrim(text + strlen("ORDER BY"));
+    char name[MAX_NAME + 1];
+    int i = 0;
+
+    *order_col = -1;
+    *order_count = 0;
+    *desc = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_' || *p == '(' ||
+           *p == ')' || *p == '*')) {
+        if (i < MAX_NAME) {
+            name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    name[i] = '\0';
+    p = ltrim(p);
+    if (eqi(p, "DESC")) {
+        *desc = 1;
+        p += strlen("DESC");
+    } else if (eqi(p, "ASC")) {
+        p += strlen("ASC");
+    }
+    p = ltrim(p);
+    if (*p != '\0') {
+        return 0;
+    }
+    if (eqi(name, "COUNT") || eqi(name, "COUNT()") ||
+        eqi(name, "COUNT(*)")) {
+        if (group_col < 0) {
+            return 0;
+        }
+        *order_count = 1;
+        return 1;
+    }
+    *order_col = find_col(t, name);
+    if (*order_col < 0) {
+        return 0;
+    }
+    if (group_col >= 0 && *order_col != group_col) {
+        return 0;
+    }
+    return 1;
+}
+
+static int add_group_row(struct GroupRow groups[], int *group_count,
+                         const char *value)
+{
+    int i;
+
+    for (i = 0; i < *group_count; i++) {
+        if (eqi(groups[i].value, value)) {
+            groups[i].count++;
+            return 1;
+        }
+    }
+    if (*group_count >= MAX_ROWS) {
+        return 0;
+    }
+    strncpy(groups[*group_count].value, value, MAX_VALUE);
+    groups[*group_count].value[MAX_VALUE] = '\0';
+    groups[*group_count].count = 1;
+    (*group_count)++;
+    return 1;
+}
+
 static void cmd_tables(struct TableDef tables[], int count)
 {
     int i;
@@ -1970,16 +2110,31 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     char name[MAX_NAME + 1];
     char *p;
     char *where;
+    char *group;
+    char *order;
+    char *next;
     int idx;
     int r;
     int c;
     int row_count = 0;
     int out_count = 0;
+    int group_count = 0;
+    int group_col = -1;
+    int order_col = -1;
+    int order_count = 0;
+    int order_desc = 0;
     int where_col;
     int index_no;
     char where_val[MAX_VALUE + 1];
+    char col_name[MAX_NAME + 1];
+    char where_buf[MAX_STATEMENT];
+    char group_buf[MAX_STATEMENT];
+    char order_buf[MAX_STATEMENT];
     struct WhereExpr expr;
     struct Row rows[MAX_ROWS];
+    struct Row out[MAX_ROWS];
+    struct GroupRow groups[MAX_ROWS];
+
     if (!starts_i(sql, "SELECT * FROM")) {
         printf("ERR ONLY SELECT * FROM table IS SUPPORTED\n");
         return;
@@ -1999,16 +2154,86 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         printf("ERR TABLE NOT FOUND\n");
         return;
     }
+    p = ltrim(p);
     where = find_i(p, "WHERE");
+    group = find_i(p, "GROUP BY");
+    order = find_i(p, "ORDER BY");
+    next = next_select_clause(where, group, order);
+    if (next == NULL && *p != '\0') {
+        printf("ERR BAD SELECT\n");
+        return;
+    }
+    if (next != NULL && next != p && *trim(p) != '\0') {
+        printf("ERR BAD SELECT\n");
+        return;
+    }
+    if ((where != NULL && group != NULL && where > group) ||
+        (where != NULL && order != NULL && where > order) ||
+        (group != NULL && order != NULL && group > order)) {
+        printf("ERR BAD SELECT\n");
+        return;
+    }
+    where_buf[0] = '\0';
+    group_buf[0] = '\0';
+    order_buf[0] = '\0';
+    if (where != NULL) {
+        int len;
+        next = next_select_clause(NULL, group != NULL && group > where ?
+                                  group : NULL,
+                                  order != NULL && order > where ?
+                                  order : NULL);
+        len = next != NULL ? (int)(next - where) : (int)strlen(where);
+        if (len >= MAX_STATEMENT) {
+            printf("ERR STATEMENT TOO LONG\n");
+            return;
+        }
+        strncpy(where_buf, where, len);
+        where_buf[len] = '\0';
+        rtrim(where_buf);
+        where = where_buf;
+    }
+    if (group != NULL) {
+        int len;
+        next = order != NULL && order > group ? order : NULL;
+        len = next != NULL ? (int)(next - group) : (int)strlen(group);
+        if (len >= MAX_STATEMENT) {
+            printf("ERR STATEMENT TOO LONG\n");
+            return;
+        }
+        strncpy(group_buf, group, len);
+        group_buf[len] = '\0';
+        rtrim(group_buf);
+        group = group_buf;
+        if (!parse_select_col_clause(group, "GROUP BY", col_name)) {
+            printf("ERR BAD GROUP BY\n");
+            return;
+        }
+        group_col = find_col(&tables[idx], col_name);
+        if (group_col < 0) {
+            printf("ERR BAD GROUP BY\n");
+            return;
+        }
+    }
+    if (order != NULL) {
+        strncpy(order_buf, order, MAX_STATEMENT - 1);
+        order_buf[MAX_STATEMENT - 1] = '\0';
+        rtrim(order_buf);
+        order = order_buf;
+        if (!parse_order_clause(&tables[idx], order, group_col, &order_col,
+                                &order_count, &order_desc)) {
+            printf("ERR BAD ORDER BY\n");
+            return;
+        }
+    }
     if (!parse_where(&tables[idx], where, &expr)) {
         printf("ERR BAD WHERE\n");
         return;
     }
-    print_select_line(&tables[idx], NULL, 1);
 
     where_col = -1;
     where_val[0] = '\0';
-    if (where_simple_eq(&expr, &where_col, where_val)) {
+    if (group_col < 0 && order == NULL &&
+        where_simple_eq(&expr, &where_col, where_val)) {
         index_no = find_index_col(&tables[idx], where_col);
     } else {
         index_no = -1;
@@ -2032,23 +2257,59 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
             if (!found || !where_match(&tables[idx], &row, &expr)) {
                 continue;
             }
-            print_select_line(&tables[idx], &row, 0);
-            out_count++;
+            if (out_count >= MAX_ROWS) {
+                printf("ERR TOO MANY ROWS\n");
+                return;
+            }
+            out[out_count++] = row;
         }
-        printf("OK %d ROWS\n", out_count);
+    } else {
+        if (!load_rows(&tables[idx], rows, &row_count)) {
+            printf("ERR CANNOT READ TABLE\n");
+            return;
+        }
+        for (r = 0; r < row_count; r++) {
+            if (!where_match(&tables[idx], &rows[r], &expr)) {
+                continue;
+            }
+            if (out_count >= MAX_ROWS) {
+                printf("ERR TOO MANY ROWS\n");
+                return;
+            }
+            out[out_count++] = rows[r];
+        }
+    }
+    if (group_col >= 0) {
+        for (r = 0; r < out_count; r++) {
+            if (!add_group_row(groups, &group_count,
+                               out[r].values[group_col])) {
+                printf("ERR TOO MANY GROUPS\n");
+                return;
+            }
+        }
+        if (order != NULL) {
+            g_sort_table = &tables[idx];
+            g_sort_col = group_col;
+            g_sort_desc = order_desc;
+            g_group_sort_by_count = order_count;
+            qsort(groups, group_count, sizeof(groups[0]), cmp_group_qsort);
+        }
+        printf("%s | COUNT\n", tables[idx].cols[group_col]);
+        for (r = 0; r < group_count; r++) {
+            printf("%s | %d\n", groups[r].value, groups[r].count);
+        }
+        printf("OK %d GROUPS\n", group_count);
         return;
     }
-
-    if (!load_rows(&tables[idx], rows, &row_count)) {
-        printf("ERR CANNOT READ TABLE\n");
-        return;
+    if (order != NULL) {
+        g_sort_table = &tables[idx];
+        g_sort_col = order_col;
+        g_sort_desc = order_desc;
+        qsort(out, out_count, sizeof(out[0]), cmp_row_qsort);
     }
-    for (r = 0; r < row_count; r++) {
-        if (!where_match(&tables[idx], &rows[r], &expr)) {
-            continue;
-        }
-        print_select_line(&tables[idx], &rows[r], 0);
-        out_count++;
+    print_select_line(&tables[idx], NULL, 1);
+    for (r = 0; r < out_count; r++) {
+        print_select_line(&tables[idx], &out[r], 0);
     }
     printf("OK %d ROWS\n", out_count);
 }
@@ -2429,8 +2690,10 @@ static void cmd_help(void)
     printf("  FOREIGN KEY (col) REFERENCES parent(pkcol)\n");
     printf("  CREATE INDEX idx ON name (col);\n");
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
-    printf("  SELECT * FROM name [WHERE expression];\n");
+    printf("  SELECT * FROM name [WHERE expression]\n");
+    printf("    [GROUP BY col] [ORDER BY col|COUNT [ASC|DESC]];\n");
     printf("  WHERE: =, <, >, LIKE, BETWEEN, AND, OR\n");
+    printf("  GROUP BY supports one column and returns column | COUNT\n");
     printf("  UPDATE name SET col=value WHERE expression;\n");
     printf("  DELETE FROM name WHERE expression;\n");
     printf("  DROP TABLE name;\n");

@@ -21,6 +21,8 @@ CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
 SELECT * FROM PEOPLE WHERE ID BETWEEN 1 AND 3;
 SELECT * FROM PEOPLE WHERE NAME LIKE 'A%' OR CITY='RIJEKA';
+SELECT * FROM PEOPLE ORDER BY AGE DESC;
+SELECT * FROM PEOPLE GROUP BY CITY ORDER BY COUNT DESC;
 CREATE TABLE ORDERS (OID INT PRIMARY KEY, PERSON_ID INT,
 ITEM VARCHAR(8), FOREIGN KEY (PERSON_ID) REFERENCES PEOPLE(ID));
 INSERT INTO ORDERS VALUES (100, 1, 'BOOK');
@@ -205,6 +207,8 @@ CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE;
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
 SELECT * FROM PEOPLE WHERE ID > 0 AND NAME LIKE 'A%';
+SELECT * FROM PEOPLE ORDER BY AGE DESC;
+SELECT * FROM PEOPLE GROUP BY CITY ORDER BY COUNT DESC;
 .QUIT
 /*
 ```
@@ -233,6 +237,8 @@ The standard batch test is `jcl/MINISQL.jcl`. The job:
 - tests `SELECT * FROM PEOPLE`
 - tests `SELECT * FROM PEOPLE WHERE CITY='RIJEKA'`
 - tests `WHERE` expressions with `AND`, `OR`, `LIKE`, `<`, `>` and `BETWEEN`
+- tests `ORDER BY` on one column
+- tests `GROUP BY` on one column with automatic `COUNT`
 - creates `ORDERS` with a single-column foreign key to `PEOPLE(ID)`
 - tests valid and invalid foreign key inserts
 - tests delete protection for referenced parent rows
@@ -349,6 +355,8 @@ INSERT INTO ORDERS VALUES (101, 99, 'BAD');
 SELECT * FROM PEOPLE WHERE ID > 1 AND CITY LIKE 'RI%';
 SELECT * FROM PEOPLE WHERE ID BETWEEN 1 AND 3;
 SELECT * FROM PEOPLE WHERE NAME LIKE 'P%' OR CITY='SPLIT';
+SELECT * FROM PEOPLE ORDER BY AGE DESC;
+SELECT * FROM PEOPLE GROUP BY CITY ORDER BY COUNT DESC;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
 UPDATE PEOPLE SET CITY='SISAK' WHERE ID=3;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
@@ -363,6 +371,8 @@ Expected behavior:
 - `.SCHEMA PEOPLE` shows `ID PRIMARY KEY` and `INDEX IDXCITY ON PEOPLE(CITY)`.
 - `SELECT ... WHERE CITY='RIJEKA'` uses the secondary index when available.
 - `WHERE` supports `AND`, `OR`, `LIKE`, `<`, `>` and `BETWEEN`.
+- `ORDER BY` sorts by one table column, or by `COUNT` for grouped results.
+- `GROUP BY` supports one column and returns `column | COUNT`.
 - single-column foreign keys validate child values against parent primary keys.
 - `ID` accepts only whole numbers because it is `INT`.
 - `NAME` accepts at most 8 characters because it is `VARCHAR(8)`.
@@ -467,17 +477,22 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - VSAM record layout is fixed: 64-byte key, 960-byte data, 1024 bytes total.
   If this layout changes, recreate `IBMUSER.MINISQL.KV` with
   `jcl/ALLOCVS.jcl`.
-- Only `SELECT * FROM table` is supported, with an optional `WHERE` expression.
+- Only `SELECT * FROM table` is supported, with optional `WHERE`, `GROUP BY`
+  and `ORDER BY` clauses.
 - `WHERE` supports `=`, `<`, `>`, `LIKE`, `BETWEEN`, `AND` and `OR`.
 - `WHERE` does not support parentheses, `NOT`, `<=`, `>=`, `<>`, `!=`, `IN`,
   `IS NULL`, or functions.
 - `AND` has higher precedence than `OR`, as in SQL.
+- `ORDER BY` supports one table column with optional `ASC` or `DESC`.
+- `GROUP BY` supports one table column and returns that column plus `COUNT`.
+- Grouped `ORDER BY` supports the grouped column or `COUNT`.
 - A secondary index is used only for `SELECT * FROM table WHERE col=value`
-  when an index exists on `col`; complex `WHERE` expressions use a linear scan.
+  when an index exists on `col` and no `GROUP BY` or `ORDER BY` is used;
+  complex `WHERE` expressions use a linear scan.
 - `UPDATE` supports one `SET col=value` and an optional `WHERE` expression.
 - `DELETE` supports an optional `WHERE` expression; without `WHERE`, it deletes
   all rows in the table.
-- There are no joins, order by, group by, aggregates, views, stored
+- There are no joins, general aggregate functions, views, stored
   procedures, transactions, rollback, or recovery log.
 - `MSQLTSO` is an interactive foreground TSO program. Use `MINISQL`, not
   `MSQLTSO`, for batch SQL.
