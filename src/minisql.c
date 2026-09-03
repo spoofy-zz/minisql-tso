@@ -2508,6 +2508,13 @@ static int run_processor(int interactive)
             break;
         }
         p = trim(line);
+        if (*p == '\0') {
+            if (interactive) {
+                printf("SQL> ");
+                fflush(stdout);
+            }
+            continue;
+        }
         if (eqi(p, ".QUIT") || eqi(p, "//QUIT") || eqi(p, "QUIT")) {
             break;
         }

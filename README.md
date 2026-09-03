@@ -218,7 +218,8 @@ Important DD statements:
 
 Each SQL command must end with `;`. Commands `.TABLES`, `.SCHEMA`, `.HELP`,
 and `.QUIT` may be entered without `;`. In a TSO session, `//HELP` and
-`//QUIT` are accepted as aliases for `.HELP` and `.QUIT`.
+`//QUIT` are accepted as aliases for `.HELP` and `.QUIT`. Blank input lines
+are ignored and are not appended to the current SQL statement buffer.
 
 ## Test From JCL
 
@@ -317,6 +318,9 @@ From a foreground TSO session, run:
 ```text
 MSQL
 ```
+
+At the `SQL>` prompt, pressing Enter on an empty line just redraws the prompt.
+It does not add an empty line to the pending SQL statement.
 
 If the CLIST is not in your `SYSPROC` or `SYSEXEC` search path, run it from
 the appropriate command procedure library, or start the processor manually:
