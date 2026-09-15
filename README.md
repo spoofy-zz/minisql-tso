@@ -21,7 +21,9 @@ SELECT COUNT(*) FROM PEOPLE;
 SELECT NAME, CITY FROM PEOPLE;
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
+EXPLAIN SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
 SELECT * FROM PEOPLE WHERE ID BETWEEN 1 AND 3;
+SELECT * FROM PEOPLE WHERE AGE>=30 ORDER BY AGE DESC LIMIT 1;
 SELECT * FROM PEOPLE WHERE NAME LIKE 'A%' OR CITY='RIJEKA';
 SELECT * FROM PEOPLE ORDER BY AGE DESC;
 SELECT * FROM PEOPLE GROUP BY CITY ORDER BY COUNT DESC;
@@ -33,6 +35,8 @@ INSERT INTO ORDERS VALUES (101, 1, 'PEN');
 ROLLBACK;
 CREATE INDEX IDXPID ON ORDERS (PERSON_ID);
 SELECT * FROM PEOPLE JOIN ORDERS ON PEOPLE.ID=ORDERS.PERSON_ID;
+SELECT P.NAME,O.ITEM FROM PEOPLE P JOIN ORDERS O ON P.ID=O.PERSON_ID;
+DROP INDEX IDXPID;
 UPDATE PEOPLE SET CITY='RIJEKA' WHERE ID=1;
 DELETE FROM PEOPLE WHERE ID=1;
 DROP TABLE PEOPLE;
@@ -80,11 +84,18 @@ the KSDS key order:
 ```sql
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
+EXPLAIN SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
+DROP INDEX IDXCITY;
 ```
 
 Indexes are maintained by rebuilding the table's secondary index records after
 row changes. This is simple and robust for small MVS/TK5 workloads, but it is
 not a SQLite-style page-level B-tree implementation.
+
+`EXPLAIN SELECT ...` prints a compact plan summary. It reports whether a
+single-table query uses a secondary index or a table scan, and whether a join
+uses an index lookup on the right-hand table or falls back to a nested-loop
+scan.
 
 ## Simple Joins
 
@@ -92,13 +103,16 @@ minisql supports one equality inner join form:
 
 ```sql
 SELECT * FROM PEOPLE JOIN ORDERS ON PEOPLE.ID=ORDERS.PERSON_ID;
+SELECT P.NAME,O.ITEM FROM PEOPLE P JOIN ORDERS O ON P.ID=O.PERSON_ID;
 ```
 
-The join prints qualified column names such as `PEOPLE.ID` and `ORDERS.OID`.
+The join supports `*` or a comma-separated list of qualified columns. Table
+aliases may be written as `PEOPLE P` or `PEOPLE AS P`. Output column headers
+are qualified, for example `PEOPLE.ID`, `ORDERS.OID`, `P.NAME` or `O.ITEM`.
 When the right-hand join column has a secondary index, minisql uses that index
 for lookup; otherwise it falls back to a nested-loop scan. Joins currently do
-not support projections, aliases, `WHERE`, `ORDER BY`, `GROUP BY`, outer joins
-or more than two tables.
+not support unqualified join projections, `WHERE`, `ORDER BY`, `GROUP BY`,
+outer joins or more than two tables.
 
 ## Interactive Screen Clear
 
@@ -602,7 +616,7 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - Types are validation metadata. Values are still stored as text in the VSAM
   row payload.
 - `INT` supports optional `+`/`-`, decimal digits, and numeric comparison in
-  `WHERE` operators `<`, `>` and `BETWEEN`.
+  `WHERE` operators `<`, `>`, `<=`, `>=` and `BETWEEN`.
 - `CHAR(n)` and `VARCHAR(n)` validate maximum length. `CHAR(n)` is not padded
   with spaces to a fixed length.
 - SQL types `DATE`, `TIME`, `DECIMAL`, `FLOAT`, `BOOLEAN` and `BLOB` are not
@@ -623,6 +637,8 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - Foreign keys reject invalid child inserts/updates and referenced parent
   deletes. There is no cascade update/delete.
 - `CREATE INDEX` supports one column per index.
+- `DROP INDEX name` removes one secondary index and rebuilds the remaining
+  indexes for that table.
 - Table, column, and index names may have at most 16 characters.
 - One column value may have at most 32 characters.
 - One stored row payload must fit in 960 bytes, including commas between
@@ -631,13 +647,16 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
   If this layout changes, recreate `IBMUSER.MINISQL.KV` with
   `jcl/ALLOCVS.jcl`.
 - `SELECT` supports `*`, a comma-separated column list, or `COUNT(*)`.
-- `SELECT` supports optional `WHERE`, `GROUP BY` and `ORDER BY` clauses.
+- `SELECT` supports optional `WHERE`, `GROUP BY`, `ORDER BY` and `LIMIT`
+  clauses.
 - `SELECT * FROM a JOIN b ON a.col=b.col` supports one equality join.
-- `WHERE` supports `=`, `<`, `>`, `LIKE`, `BETWEEN`, `AND` and `OR`.
-- `WHERE` does not support parentheses, `NOT`, `<=`, `>=`, `<>`, `!=`, `IN`,
-  `IS NULL`, or functions.
+- Join queries also support qualified projections and table aliases.
+- `WHERE` supports `=`, `<`, `>`, `<=`, `>=`, `<>`, `!=`, `LIKE`, `BETWEEN`,
+  `AND` and `OR`.
+- `WHERE` does not support parentheses, `NOT`, `IN`, `IS NULL`, or functions.
 - `AND` has higher precedence than `OR`, as in SQL.
 - `ORDER BY` supports one table column with optional `ASC` or `DESC`.
+- `LIMIT n` limits row or group output for `SELECT`.
 - `GROUP BY` supports one table column and returns that column plus `COUNT`.
 - Grouped `ORDER BY` supports the grouped column or `COUNT`.
 - `COUNT(*)` supports an optional `WHERE`; with `GROUP BY`, it counts each

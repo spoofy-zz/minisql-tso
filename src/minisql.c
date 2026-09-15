@@ -23,6 +23,7 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define MAX_INDEXES 4
 #define MAX_FKS 4
 #define MAX_DEFS (MAX_COLS + MAX_FKS + 1)
+#define MAX_JOIN_COLS (MAX_COLS * 2)
 #define MAX_STATEMENT 2048
 #define KV_KEY 64
 #define KV_DATA 960
@@ -38,6 +39,9 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define OP_GT 3
 #define OP_LIKE 4
 #define OP_BETWEEN 5
+#define OP_LE 6
+#define OP_GE 7
+#define OP_NE 8
 #define LOGIC_AND 1
 #define LOGIC_OR 2
 #define TX_NONE 0
@@ -94,6 +98,11 @@ struct GroupRow {
     int count;
 };
 
+struct JoinProj {
+    int source;
+    int col;
+};
+
 struct KvRec {
     char key[KV_KEY];
     char data[KV_DATA];
@@ -106,6 +115,7 @@ static int parse_where(struct TableDef *t, char *where_text,
                        struct WhereExpr *expr);
 static int validate_value(struct TableDef *t, int col, const char *value);
 static void cmd_select_join(struct TableDef tables[], int count, char *sql);
+static void cmd_explain(struct TableDef tables[], int count, char *sql);
 static int kv_put_raw(const char *key, const char *data);
 static int kv_delete_raw(const char *key);
 static int kv_put(const char *key, const char *data);
@@ -784,6 +794,8 @@ static int line_starts_command(const char *s)
            starts_i(s, "DESCRIBE") ||
            starts_i(s, "CREATE TABLE") ||
            starts_i(s, "CREATE INDEX") ||
+           starts_i(s, "DROP INDEX") ||
+           starts_i(s, "EXPLAIN") ||
            starts_i(s, "INSERT INTO") ||
            starts_i(s, "SELECT") ||
            starts_i(s, "UPDATE") ||
@@ -1107,6 +1119,15 @@ static int eval_cond(struct TableDef *t, struct Row *row,
     }
     if (cond->op == OP_GT) {
         return cmp_value(t, cond->col, val, cond->value1) > 0;
+    }
+    if (cond->op == OP_LE) {
+        return cmp_value(t, cond->col, val, cond->value1) <= 0;
+    }
+    if (cond->op == OP_GE) {
+        return cmp_value(t, cond->col, val, cond->value1) >= 0;
+    }
+    if (cond->op == OP_NE) {
+        return !eqi(val, cond->value1);
     }
     if (cond->op == OP_LIKE) {
         return like_match(val, cond->value1);
@@ -2022,7 +2043,8 @@ static int cmp_group_qsort(const void *a, const void *b)
     return g_sort_desc ? -rc : rc;
 }
 
-static char *next_select_clause(char *where, char *group, char *order)
+static char *next_select_clause(char *where, char *group, char *order,
+                                char *limit)
 {
     char *next = NULL;
 
@@ -2034,6 +2056,9 @@ static char *next_select_clause(char *where, char *group, char *order)
     }
     if (order != NULL && (next == NULL || order < next)) {
         next = order;
+    }
+    if (limit != NULL && (next == NULL || limit < next)) {
+        next = limit;
     }
     return next;
 }
@@ -2102,6 +2127,27 @@ static int parse_order_clause(struct TableDef *t, char *text, int group_col,
     return 1;
 }
 
+static int parse_limit_clause(char *text, int *limit)
+{
+    char *p = ltrim(text + strlen("LIMIT"));
+    int n;
+
+    if (*p == '\0') {
+        return 0;
+    }
+    n = 0;
+    while (*p != '\0' && isdigit((unsigned char)*p)) {
+        n = n * 10 + (*p - '0');
+        p++;
+    }
+    p = ltrim(p);
+    if (*p != '\0' || n < 0) {
+        return 0;
+    }
+    *limit = n;
+    return 1;
+}
+
 static int add_group_row(struct GroupRow groups[], int group_cap,
                          int *group_count, const char *value)
 {
@@ -2143,11 +2189,123 @@ static int parse_qualified_col(char *text, char *table, char *col)
     return valid_name(table) && valid_name(col);
 }
 
-static void print_join_header(struct TableDef *left, struct TableDef *right)
+static int name_matches(const char *token, const char *table,
+                        const char *alias)
+{
+    return eqi(token, table) || (alias[0] != '\0' && eqi(token, alias));
+}
+
+static int parse_alias_segment(char *start, char *end, char *alias)
+{
+    char buf[MAX_VALUE + 1];
+    char *p;
+    int len;
+    int i = 0;
+
+    alias[0] = '\0';
+    len = (int)(end - start);
+    if (len <= 0) {
+        return 1;
+    }
+    if (len > MAX_VALUE) {
+        return 0;
+    }
+    strncpy(buf, start, len);
+    buf[len] = '\0';
+    p = trim(buf);
+    if (*p == '\0') {
+        return 1;
+    }
+    if (starts_i(p, "AS") && isspace((unsigned char)p[2])) {
+        p = ltrim(p + 2);
+    }
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            alias[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    alias[i] = '\0';
+    p = ltrim(p);
+    return valid_name(alias) && *p == '\0';
+}
+
+static int parse_join_select_list(char *text, struct TableDef *left,
+                                  const char *left_alias,
+                                  struct TableDef *right,
+                                  const char *right_alias,
+                                  struct JoinProj projs[],
+                                  int *proj_count, int *select_all)
+{
+    char vals[MAX_JOIN_COLS][MAX_VALUE + 1];
+    int val_count = 0;
+    int i;
+
+    *proj_count = 0;
+    *select_all = 0;
+    clean_token_max(text, MAX_STATEMENT);
+    if (eqi(text, "*")) {
+        *select_all = 1;
+        return 1;
+    }
+    if (!parse_csv_limit(text, vals, &val_count, MAX_JOIN_COLS) ||
+        val_count < 1) {
+        return 0;
+    }
+    for (i = 0; i < val_count; i++) {
+        char qtable[MAX_NAME + 1];
+        char qcol[MAX_NAME + 1];
+        int col;
+
+        if (!parse_qualified_col(vals[i], qtable, qcol)) {
+            return 0;
+        }
+        if (name_matches(qtable, left->name, left_alias)) {
+            col = find_col(left, qcol);
+            if (col < 0) {
+                return 0;
+            }
+            projs[*proj_count].source = 0;
+            projs[*proj_count].col = col;
+            (*proj_count)++;
+        } else if (name_matches(qtable, right->name, right_alias)) {
+            col = find_col(right, qcol);
+            if (col < 0) {
+                return 0;
+            }
+            projs[*proj_count].source = 1;
+            projs[*proj_count].col = col;
+            (*proj_count)++;
+        } else {
+            return 0;
+        }
+    }
+    return *proj_count > 0;
+}
+
+static void print_join_header(struct TableDef *left, const char *left_alias,
+                              struct TableDef *right, const char *right_alias,
+                              struct JoinProj projs[], int proj_count,
+                              int select_all)
 {
     int c;
     int first = 1;
 
+    if (!select_all) {
+        for (c = 0; c < proj_count; c++) {
+            struct TableDef *t = projs[c].source == 0 ? left : right;
+            const char *alias = projs[c].source == 0 ? left_alias :
+                right_alias;
+            if (!first) {
+                printf(" | ");
+            }
+            printf("%s.%s", alias[0] != '\0' ? alias : t->name,
+                   t->cols[projs[c].col]);
+            first = 0;
+        }
+        printf("\n");
+        return;
+    }
     for (c = 0; c < left->col_count; c++) {
         if (!first) {
             printf(" | ");
@@ -2166,11 +2324,25 @@ static void print_join_header(struct TableDef *left, struct TableDef *right)
 }
 
 static void print_join_row(struct TableDef *left, struct Row *lrow,
-                           struct TableDef *right, struct Row *rrow)
+                           struct TableDef *right, struct Row *rrow,
+                           struct JoinProj projs[], int proj_count,
+                           int select_all)
 {
     int c;
     int first = 1;
 
+    if (!select_all) {
+        for (c = 0; c < proj_count; c++) {
+            struct Row *row = projs[c].source == 0 ? lrow : rrow;
+            if (!first) {
+                printf(" | ");
+            }
+            printf("%s", row->values[projs[c].col]);
+            first = 0;
+        }
+        printf("\n");
+        return;
+    }
     for (c = 0; c < left->col_count; c++) {
         if (!first) {
             printf(" | ");
@@ -2192,12 +2364,16 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
 {
     char left_name[MAX_NAME + 1];
     char right_name[MAX_NAME + 1];
+    char left_alias[MAX_NAME + 1];
+    char right_alias[MAX_NAME + 1];
     char qleft_table[MAX_NAME + 1];
     char qleft_col[MAX_NAME + 1];
     char qright_table[MAX_NAME + 1];
     char qright_col[MAX_NAME + 1];
+    char select_buf[MAX_STATEMENT];
     char onbuf[MAX_STATEMENT];
     char *p;
+    char *fromp;
     char *joinp;
     char *onp;
     char *eq;
@@ -2208,21 +2384,25 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
     int right_col;
     int right_index;
     int matched = 0;
+    int select_all = 0;
+    int proj_count = 0;
+    struct JoinProj projs[MAX_JOIN_COLS];
     struct RowSet left_rows;
     struct RowSet right_rows;
 
-    p = ltrim(sql + strlen("SELECT"));
-    if (*p != '*') {
-        printf("ERR JOIN SUPPORTS SELECT *\n");
-        return;
-    }
-    p++;
-    p = ltrim(p);
-    if (!starts_i(p, "FROM")) {
+    fromp = find_keyword(sql + strlen("SELECT"), "FROM");
+    if (fromp == NULL) {
         printf("ERR BAD JOIN\n");
         return;
     }
-    p = ltrim(p + strlen("FROM"));
+    i = (int)(fromp - (sql + strlen("SELECT")));
+    if (i <= 0 || i >= MAX_STATEMENT) {
+        printf("ERR BAD JOIN\n");
+        return;
+    }
+    strncpy(select_buf, sql + strlen("SELECT"), i);
+    select_buf[i] = '\0';
+    p = ltrim(fromp + strlen("FROM"));
     i = 0;
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
         if (i < MAX_NAME) {
@@ -2232,7 +2412,8 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
     }
     left_name[i] = '\0';
     joinp = find_keyword(p, "JOIN");
-    if (!valid_name(left_name) || joinp == NULL) {
+    if (!valid_name(left_name) || joinp == NULL ||
+        !parse_alias_segment(p, joinp, left_alias)) {
         printf("ERR BAD JOIN\n");
         return;
     }
@@ -2246,7 +2427,8 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
     }
     right_name[i] = '\0';
     onp = find_keyword(p, "ON");
-    if (!valid_name(right_name) || onp == NULL) {
+    if (!valid_name(right_name) || onp == NULL ||
+        !parse_alias_segment(p, onp, right_alias)) {
         printf("ERR BAD JOIN\n");
         return;
     }
@@ -2269,8 +2451,15 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
         printf("ERR TABLE NOT FOUND\n");
         return;
     }
-    if (!eqi(qleft_table, left_name) || !eqi(qright_table, right_name)) {
+    if (!name_matches(qleft_table, left_name, left_alias) ||
+        !name_matches(qright_table, right_name, right_alias)) {
         printf("ERR JOIN ORDER\n");
+        return;
+    }
+    if (!parse_join_select_list(select_buf, &tables[left_idx], left_alias,
+                                &tables[right_idx], right_alias, projs,
+                                &proj_count, &select_all)) {
+        printf("ERR BAD SELECT LIST\n");
         return;
     }
     left_col = find_col(&tables[left_idx], qleft_col);
@@ -2284,7 +2473,8 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
         return;
     }
     right_index = find_index_col(&tables[right_idx], right_col);
-    print_join_header(&tables[left_idx], &tables[right_idx]);
+    print_join_header(&tables[left_idx], left_alias, &tables[right_idx],
+                      right_alias, projs, proj_count, select_all);
     if (right_index >= 0) {
         int l;
 
@@ -2323,7 +2513,8 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
                 if (found && eqi(left_rows.rows[l].values[left_col],
                                  rrow.values[right_col])) {
                     print_join_row(&tables[left_idx], &left_rows.rows[l],
-                                   &tables[right_idx], &rrow);
+                                   &tables[right_idx], &rrow, projs,
+                                   proj_count, select_all);
                     matched++;
                 }
             }
@@ -2343,7 +2534,8 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
                 if (eqi(left_rows.rows[l].values[left_col],
                         right_rows.rows[r].values[right_col])) {
                     print_join_row(&tables[left_idx], &left_rows.rows[l],
-                                   &tables[right_idx], &right_rows.rows[r]);
+                                   &tables[right_idx], &right_rows.rows[r],
+                                   projs, proj_count, select_all);
                     matched++;
                 }
             }
@@ -2788,6 +2980,57 @@ static void cmd_create_index(struct TableDef tables[], int count, char *sql)
     printf("OK INDEX CREATED\n");
 }
 
+static void cmd_drop_index(struct TableDef tables[], int count, char *sql)
+{
+    char idx_name[MAX_NAME + 1];
+    int t;
+    int i;
+    int found_table = -1;
+    int found_index = -1;
+    struct RowSet rows;
+
+    if (!parse_name_after(sql, "DROP INDEX", idx_name)) {
+        printf("ERR USAGE: DROP INDEX name\n");
+        return;
+    }
+    for (t = 0; t < count; t++) {
+        i = find_index_name(&tables[t], idx_name);
+        if (i >= 0) {
+            found_table = t;
+            found_index = i;
+            break;
+        }
+    }
+    if (found_table < 0) {
+        printf("ERR INDEX NOT FOUND\n");
+        return;
+    }
+    if (!load_rows(&tables[found_table], &rows)) {
+        printf("ERR CANNOT READ TABLE\n");
+        return;
+    }
+    for (i = found_index; i < tables[found_table].index_count - 1; i++) {
+        strncpy(tables[found_table].index_names[i],
+                tables[found_table].index_names[i + 1], MAX_NAME);
+        tables[found_table].index_names[i][MAX_NAME] = '\0';
+        tables[found_table].index_cols[i] =
+            tables[found_table].index_cols[i + 1];
+    }
+    tables[found_table].index_count--;
+    if (!delete_index_rows(&tables[found_table]) ||
+        !rebuild_indexes(&tables[found_table], rows.rows, rows.count)) {
+        rowset_free(&rows);
+        printf("ERR CANNOT DELETE INDEX\n");
+        return;
+    }
+    rowset_free(&rows);
+    if (!save_catalog(tables, count)) {
+        printf("ERR CANNOT WRITE CATALOG\n");
+        return;
+    }
+    printf("OK INDEX DROPPED\n");
+}
+
 static void cmd_insert(struct TableDef tables[], int count, char *sql)
 {
     char name[MAX_NAME + 1];
@@ -2882,6 +3125,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     char *where;
     char *group;
     char *order;
+    char *limit;
     char *next;
     int idx;
     int r;
@@ -2891,6 +3135,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     int order_col = -1;
     int order_count = 0;
     int order_desc = 0;
+    int limit_count = -1;
     int select_cols[MAX_COLS];
     int select_col_count = 0;
     int select_all = 0;
@@ -2903,6 +3148,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     char where_buf[MAX_STATEMENT];
     char group_buf[MAX_STATEMENT];
     char order_buf[MAX_STATEMENT];
+    char limit_buf[MAX_STATEMENT];
     struct WhereExpr expr;
     struct RowSet rows;
     struct RowSet out;
@@ -2960,7 +3206,8 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     where = find_i(p, "WHERE");
     group = find_i(p, "GROUP BY");
     order = find_i(p, "ORDER BY");
-    next = next_select_clause(where, group, order);
+    limit = find_i(p, "LIMIT");
+    next = next_select_clause(where, group, order, limit);
     if (next == NULL && *p != '\0') {
         printf("ERR BAD SELECT\n");
         return;
@@ -2971,19 +3218,25 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     }
     if ((where != NULL && group != NULL && where > group) ||
         (where != NULL && order != NULL && where > order) ||
-        (group != NULL && order != NULL && group > order)) {
+        (where != NULL && limit != NULL && where > limit) ||
+        (group != NULL && order != NULL && group > order) ||
+        (group != NULL && limit != NULL && group > limit) ||
+        (order != NULL && limit != NULL && order > limit)) {
         printf("ERR BAD SELECT\n");
         return;
     }
     where_buf[0] = '\0';
     group_buf[0] = '\0';
     order_buf[0] = '\0';
+    limit_buf[0] = '\0';
     if (where != NULL) {
         int len;
         next = next_select_clause(NULL, group != NULL && group > where ?
                                   group : NULL,
                                   order != NULL && order > where ?
-                                  order : NULL);
+                                  order : NULL,
+                                  limit != NULL && limit > where ?
+                                  limit : NULL);
         len = next != NULL ? (int)(next - where) : (int)strlen(where);
         if (len >= MAX_STATEMENT) {
             printf("ERR STATEMENT TOO LONG\n");
@@ -2996,7 +3249,11 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     }
     if (group != NULL) {
         int len;
-        next = order != NULL && order > group ? order : NULL;
+        next = next_select_clause(NULL, NULL,
+                                  order != NULL && order > group ?
+                                  order : NULL,
+                                  limit != NULL && limit > group ?
+                                  limit : NULL);
         len = next != NULL ? (int)(next - group) : (int)strlen(group);
         if (len >= MAX_STATEMENT) {
             printf("ERR STATEMENT TOO LONG\n");
@@ -3017,13 +3274,30 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         }
     }
     if (order != NULL) {
-        strncpy(order_buf, order, MAX_STATEMENT - 1);
-        order_buf[MAX_STATEMENT - 1] = '\0';
+        int len;
+        next = limit != NULL && limit > order ? limit : NULL;
+        len = next != NULL ? (int)(next - order) : (int)strlen(order);
+        if (len >= MAX_STATEMENT) {
+            printf("ERR STATEMENT TOO LONG\n");
+            return;
+        }
+        strncpy(order_buf, order, len);
+        order_buf[len] = '\0';
         rtrim(order_buf);
         order = order_buf;
         if (!parse_order_clause(&tables[idx], order, group_col, &order_col,
                                 &order_count, &order_desc)) {
             printf("ERR BAD ORDER BY\n");
+            return;
+        }
+    }
+    if (limit != NULL) {
+        strncpy(limit_buf, limit, MAX_STATEMENT - 1);
+        limit_buf[MAX_STATEMENT - 1] = '\0';
+        rtrim(limit_buf);
+        limit = limit_buf;
+        if (!parse_limit_clause(limit, &limit_count)) {
+            printf("ERR BAD LIMIT\n");
             return;
         }
     }
@@ -3142,7 +3416,8 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         } else {
             printf("%s\n", tables[idx].cols[group_col]);
         }
-        for (r = 0; r < group_count; r++) {
+        for (r = 0; r < group_count &&
+             (limit_count < 0 || r < limit_count); r++) {
             if (select_all || (select_col_count > 0 && select_count)) {
                 printf("%s | %d\n", groups[r].value, groups[r].count);
             } else if (select_count) {
@@ -3151,7 +3426,9 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
                 printf("%s\n", groups[r].value);
             }
         }
-        printf("OK %d GROUPS\n", group_count);
+        printf("OK %d GROUPS\n",
+               limit_count >= 0 && group_count > limit_count ?
+               limit_count : group_count);
         free(groups);
         rowset_free(&out);
         return;
@@ -3180,7 +3457,7 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         print_projected_line(&tables[idx], NULL, select_cols,
                              select_col_count, 1);
     }
-    for (r = 0; r < out.count; r++) {
+    for (r = 0; r < out.count && (limit_count < 0 || r < limit_count); r++) {
         if (select_all) {
             print_select_line(&tables[idx], &out.rows[r], 0);
         } else {
@@ -3188,7 +3465,9 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
                                  select_col_count, 0);
         }
     }
-    printf("OK %d ROWS\n", out.count);
+    printf("OK %d ROWS\n",
+           limit_count >= 0 && out.count > limit_count ?
+           limit_count : out.count);
     rowset_free(&out);
 }
 
@@ -3219,11 +3498,17 @@ static int where_tokenize(char *text,
             if (*p == quote) {
                 p++;
             }
-        } else if (*p == '=' || *p == '<' || *p == '>') {
+        } else if (*p == '=' || *p == '<' || *p == '>' || *p == '!') {
             toks[n][i++] = *p++;
+            if ((*toks[n] == '<' || *toks[n] == '>' || *toks[n] == '!') &&
+                *p == '=') {
+                toks[n][i++] = *p++;
+            } else if (*toks[n] == '<' && *p == '>') {
+                toks[n][i++] = *p++;
+            }
         } else {
             while (*p != '\0' && !isspace((unsigned char)*p) &&
-                   *p != '=' && *p != '<' && *p != '>') {
+                   *p != '=' && *p != '<' && *p != '>' && *p != '!') {
                 if (i < MAX_VALUE) {
                     toks[n][i++] = *p;
                 }
@@ -3289,6 +3574,12 @@ static int parse_where_cond(struct TableDef *t,
         cond->op = OP_LT;
     } else if (eqi(toks[*pos], ">")) {
         cond->op = OP_GT;
+    } else if (eqi(toks[*pos], "<=")) {
+        cond->op = OP_LE;
+    } else if (eqi(toks[*pos], ">=")) {
+        cond->op = OP_GE;
+    } else if (eqi(toks[*pos], "<>") || eqi(toks[*pos], "!=")) {
+        cond->op = OP_NE;
     } else {
         return 0;
     }
@@ -3349,6 +3640,211 @@ static int parse_where(struct TableDef *t, char *where_text,
         pos++;
     }
     return 1;
+}
+
+static void explain_select_join(struct TableDef tables[], int count, char *sql)
+{
+    char left_name[MAX_NAME + 1];
+    char right_name[MAX_NAME + 1];
+    char left_alias[MAX_NAME + 1];
+    char right_alias[MAX_NAME + 1];
+    char qleft_table[MAX_NAME + 1];
+    char qleft_col[MAX_NAME + 1];
+    char qright_table[MAX_NAME + 1];
+    char qright_col[MAX_NAME + 1];
+    char onbuf[MAX_STATEMENT];
+    char *p;
+    char *fromp;
+    char *joinp;
+    char *onp;
+    char *eq;
+    int i;
+    int left_idx;
+    int right_idx;
+    int right_col;
+    int right_index;
+
+    fromp = find_keyword(sql + strlen("SELECT"), "FROM");
+    if (fromp == NULL) {
+        printf("PLAN ERROR BAD JOIN\n");
+        return;
+    }
+    p = ltrim(fromp + strlen("FROM"));
+    i = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            left_name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    left_name[i] = '\0';
+    joinp = find_keyword(p, "JOIN");
+    if (!valid_name(left_name) || joinp == NULL ||
+        !parse_alias_segment(p, joinp, left_alias)) {
+        printf("PLAN ERROR BAD JOIN\n");
+        return;
+    }
+    p = ltrim(joinp + strlen("JOIN"));
+    i = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            right_name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    right_name[i] = '\0';
+    onp = find_keyword(p, "ON");
+    if (!valid_name(right_name) || onp == NULL ||
+        !parse_alias_segment(p, onp, right_alias)) {
+        printf("PLAN ERROR BAD JOIN\n");
+        return;
+    }
+    strncpy(onbuf, onp + strlen("ON"), MAX_STATEMENT - 1);
+    onbuf[MAX_STATEMENT - 1] = '\0';
+    eq = strchr(onbuf, '=');
+    if (eq == NULL) {
+        printf("PLAN ERROR BAD JOIN\n");
+        return;
+    }
+    *eq = '\0';
+    if (!parse_qualified_col(onbuf, qleft_table, qleft_col) ||
+        !parse_qualified_col(eq + 1, qright_table, qright_col)) {
+        printf("PLAN ERROR BAD JOIN\n");
+        return;
+    }
+    left_idx = find_table(tables, count, left_name);
+    right_idx = find_table(tables, count, right_name);
+    if (left_idx < 0 || right_idx < 0) {
+        printf("PLAN ERROR TABLE NOT FOUND\n");
+        return;
+    }
+    if (!name_matches(qleft_table, left_name, left_alias) ||
+        !name_matches(qright_table, right_name, right_alias)) {
+        printf("PLAN ERROR JOIN ORDER\n");
+        return;
+    }
+    right_col = find_col(&tables[right_idx], qright_col);
+    if (right_col < 0) {
+        printf("PLAN ERROR BAD JOIN COLUMN\n");
+        return;
+    }
+    right_index = find_index_col(&tables[right_idx], right_col);
+    printf("PLAN JOIN %s -> %s\n", left_name, right_name);
+    printf("PLAN LEFT TABLE SCAN %s\n", left_name);
+    if (right_index >= 0) {
+        printf("PLAN RIGHT INDEX LOOKUP %s ON %s(%s)\n",
+               tables[right_idx].index_names[right_index],
+               tables[right_idx].name, tables[right_idx].cols[right_col]);
+    } else {
+        printf("PLAN RIGHT TABLE SCAN %s\n", right_name);
+    }
+}
+
+static void cmd_explain(struct TableDef tables[], int count, char *sql)
+{
+    char stmt[MAX_STATEMENT];
+    char name[MAX_NAME + 1];
+    char where_buf[MAX_STATEMENT];
+    char *s;
+    char *p;
+    char *where;
+    char *group;
+    char *order;
+    char *limit;
+    char *next;
+    int c;
+    int idx;
+    int where_col;
+    int index_no;
+    char where_val[MAX_VALUE + 1];
+    struct WhereExpr expr;
+
+    s = ltrim(sql + strlen("EXPLAIN"));
+    if (!starts_i(s, "SELECT")) {
+        printf("PLAN ERROR ONLY SELECT SUPPORTED\n");
+        return;
+    }
+    strncpy(stmt, s, MAX_STATEMENT - 1);
+    stmt[MAX_STATEMENT - 1] = '\0';
+    if (find_keyword(stmt + strlen("SELECT"), "JOIN") != NULL) {
+        explain_select_join(tables, count, stmt);
+        return;
+    }
+    p = find_keyword(stmt + strlen("SELECT"), "FROM");
+    if (p == NULL) {
+        printf("PLAN ERROR BAD SELECT\n");
+        return;
+    }
+    p += strlen("FROM");
+    p = ltrim(p);
+    c = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (c < MAX_NAME) {
+            name[c++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    name[c] = '\0';
+    idx = find_table(tables, count, name);
+    if (idx < 0) {
+        printf("PLAN ERROR TABLE NOT FOUND\n");
+        return;
+    }
+    p = ltrim(p);
+    where = find_i(p, "WHERE");
+    group = find_i(p, "GROUP BY");
+    order = find_i(p, "ORDER BY");
+    limit = find_i(p, "LIMIT");
+    where_buf[0] = '\0';
+    if (where != NULL) {
+        int len;
+
+        next = next_select_clause(NULL, group != NULL && group > where ?
+                                  group : NULL,
+                                  order != NULL && order > where ?
+                                  order : NULL,
+                                  limit != NULL && limit > where ?
+                                  limit : NULL);
+        len = next != NULL ? (int)(next - where) : (int)strlen(where);
+        if (len >= MAX_STATEMENT) {
+            printf("PLAN ERROR STATEMENT TOO LONG\n");
+            return;
+        }
+        strncpy(where_buf, where, len);
+        where_buf[len] = '\0';
+        rtrim(where_buf);
+        where = where_buf;
+    }
+    if (!parse_where(&tables[idx], where, &expr)) {
+        printf("PLAN ERROR BAD WHERE\n");
+        return;
+    }
+    where_col = -1;
+    where_val[0] = '\0';
+    index_no = -1;
+    if (group == NULL && order == NULL &&
+        where_simple_eq(&expr, &where_col, where_val)) {
+        index_no = find_index_col(&tables[idx], where_col);
+    }
+    if (index_no >= 0) {
+        printf("PLAN INDEX LOOKUP %s ON %s(%s)\n",
+               tables[idx].index_names[index_no],
+               tables[idx].name, tables[idx].cols[where_col]);
+    } else {
+        printf("PLAN TABLE SCAN %s\n", tables[idx].name);
+    }
+    if (where != NULL) {
+        printf("PLAN FILTER %d CONDITION(S)\n", expr.cond_count);
+    }
+    if (group != NULL) {
+        printf("PLAN GROUP\n");
+    }
+    if (order != NULL) {
+        printf("PLAN SORT\n");
+    }
+    if (limit != NULL) {
+        printf("PLAN LIMIT\n");
+    }
 }
 
 static void cmd_delete(struct TableDef tables[], int count, char *sql)
@@ -3590,11 +4086,13 @@ static void cmd_help(void)
     printf("  CREATE TABLE name (id, col2, PRIMARY KEY (id));\n");
     printf("  FOREIGN KEY (col) REFERENCES parent(pkcol)\n");
     printf("  CREATE INDEX idx ON name (col);\n");
+    printf("  DROP INDEX idx;\n");
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
     printf("  SELECT *|cols|COUNT(*) FROM name [WHERE expression]\n");
-    printf("    [GROUP BY col] [ORDER BY col|COUNT [ASC|DESC]];\n");
+    printf("    [GROUP BY col] [ORDER BY col|COUNT [ASC|DESC]] [LIMIT n];\n");
     printf("  SELECT * FROM a JOIN b ON a.col=b.col;\n");
-    printf("  WHERE: =, <, >, LIKE, BETWEEN, AND, OR\n");
+    printf("  EXPLAIN SELECT ...;\n");
+    printf("  WHERE: =, <, >, <=, >=, <>, !=, LIKE, BETWEEN, AND, OR\n");
     printf("  GROUP BY supports one column and returns column | COUNT\n");
     printf("  UPDATE name SET col=value WHERE expression;\n");
     printf("  DELETE FROM name WHERE expression;\n");
@@ -3686,6 +4184,7 @@ static void execute(char *sql)
 
     if (!g_tx_active &&
         (starts_i(s, "CREATE TABLE") || starts_i(s, "CREATE INDEX") ||
+         starts_i(s, "DROP INDEX") ||
          starts_i(s, "INSERT INTO") || starts_i(s, "DELETE FROM") ||
          starts_i(s, "UPDATE") || starts_i(s, "DROP TABLE"))) {
         if (!tx_begin(TX_IMPLICIT)) {
@@ -3705,10 +4204,14 @@ static void execute(char *sql)
         cmd_create(tables, &table_count, s);
     } else if (starts_i(s, "CREATE INDEX")) {
         cmd_create_index(tables, table_count, s);
+    } else if (starts_i(s, "DROP INDEX")) {
+        cmd_drop_index(tables, table_count, s);
     } else if (starts_i(s, "INSERT INTO")) {
         cmd_insert(tables, table_count, s);
     } else if (starts_i(s, "SELECT")) {
         cmd_select(tables, table_count, s);
+    } else if (starts_i(s, "EXPLAIN")) {
+        cmd_explain(tables, table_count, s);
     } else if (starts_i(s, "DELETE FROM")) {
         cmd_delete(tables, table_count, s);
     } else if (starts_i(s, "UPDATE")) {
