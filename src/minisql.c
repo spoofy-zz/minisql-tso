@@ -217,18 +217,13 @@ static void kv_make_index_key(char *out, const char *table,
     memcpy(out, tmp, strlen(tmp));
 }
 
-static void kv_make_index_prefix(char *out, const char *table,
-                                 const char *idx, const char *value,
-                                 int *len)
+static void kv_make_index_base_prefix(char *out, const char *table,
+                                      const char *idx, int *len)
 {
     char tmp[KV_KEY + 1];
-    char val[MAX_VALUE + 1];
 
     memset(out, ' ', KV_KEY);
-    strncpy(val, value, MAX_VALUE);
-    val[MAX_VALUE] = '\0';
-    clean_token(val);
-    sprintf(tmp, "X|%-16.16s|%-16.16s|%-18.18s|", table, idx, val);
+    sprintf(tmp, "X|%-16.16s|%-16.16s|", table, idx);
     memcpy(out, tmp, strlen(tmp));
     *len = (int)strlen(tmp);
 }
@@ -2485,10 +2480,9 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
             int k;
 
             keyset_init(&keys);
-            kv_make_index_prefix(prefix, tables[right_idx].name,
-                                 tables[right_idx].index_names[right_index],
-                                 left_rows.rows[l].values[left_col],
-                                 &prefix_len);
+            kv_make_index_base_prefix(prefix, tables[right_idx].name,
+                                      tables[right_idx].index_names[right_index],
+                                      &prefix_len);
             if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
                 keyset_free(&keys);
                 rowset_free(&left_rows);
@@ -3320,9 +3314,9 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         int prefix_len;
 
         keyset_init(&keys);
-        kv_make_index_prefix(prefix, tables[idx].name,
-                             tables[idx].index_names[index_no],
-                             where_val, &prefix_len);
+        kv_make_index_base_prefix(prefix, tables[idx].name,
+                                  tables[idx].index_names[index_no],
+                                  &prefix_len);
         if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
             keyset_free(&keys);
             printf("ERR CANNOT READ INDEX\n");

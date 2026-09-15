@@ -78,8 +78,8 @@ Practical table size is therefore limited by VSAM space, available memory, and
 the `999999` row-slot key space.
 
 Secondary indexes are stored as their own sorted KV entries using the indexed
-value and row slot in the key. This lets equality predicates seek by prefix in
-the KSDS key order:
+value and row slot in the key. Equality predicates scan the selected index
+namespace and then re-check the matching row value:
 
 ```sql
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
@@ -93,9 +93,9 @@ row changes. This is simple and robust for small MVS/TK5 workloads, but it is
 not a SQLite-style page-level B-tree implementation.
 
 `EXPLAIN SELECT ...` prints a compact plan summary. It reports whether a
-single-table query uses a secondary index or a table scan, and whether a join
-uses an index lookup on the right-hand table or falls back to a nested-loop
-scan.
+single-table query uses a secondary index namespace or a table scan, and
+whether a join uses the right-hand table's index namespace or falls back to a
+nested-loop scan.
 
 ## Simple Joins
 
