@@ -17,7 +17,8 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define MAX_COLS 16
 #define MAX_VALUE 32
 #define MAX_DEF_TEXT 128
-#define MAX_ROWS 256
+#define ROWSET_INITIAL 32
+#define MAX_ROW_SLOTS 999999
 #define MAX_TABLES 32
 #define MAX_INDEXES 4
 #define MAX_FKS 4
@@ -39,6 +40,9 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 #define OP_BETWEEN 5
 #define LOGIC_AND 1
 #define LOGIC_OR 2
+#define TX_NONE 0
+#define TX_USER 1
+#define TX_IMPLICIT 2
 
 struct TableDef {
     char name[MAX_NAME + 1];
@@ -58,6 +62,18 @@ struct TableDef {
 
 struct Row {
     char values[MAX_COLS][MAX_VALUE + 1];
+};
+
+struct RowSet {
+    struct Row *rows;
+    int count;
+    int cap;
+};
+
+struct KeySet {
+    char (*keys)[KV_KEY];
+    int count;
+    int cap;
 };
 
 struct WhereCond {
@@ -84,13 +100,24 @@ struct KvRec {
 };
 
 static void rtrim(char *s);
+static void clean_token(char *s);
+static int eqi(const char *a, const char *b);
 static int parse_where(struct TableDef *t, char *where_text,
                        struct WhereExpr *expr);
 static int validate_value(struct TableDef *t, int col, const char *value);
+static void cmd_select_join(struct TableDef tables[], int count, char *sql);
+static int kv_put_raw(const char *key, const char *data);
+static int kv_delete_raw(const char *key);
+static int kv_put(const char *key, const char *data);
+static int kv_delete(const char *key);
+static int key_cb(const char *key, const char *data, void *arg);
 static struct TableDef *g_sort_table = NULL;
 static int g_sort_col = -1;
 static int g_sort_desc = 0;
 static int g_group_sort_by_count = 0;
+static int g_tx_active = 0;
+static int g_tx_mode = TX_NONE;
+static int g_tx_seq = 0;
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
 static char g_tso_out[MAX_LINE];
@@ -164,13 +191,49 @@ static void kv_make_key(char *out, const char *kind, const char *name, int seq)
 }
 
 static void kv_make_index_key(char *out, const char *table,
-                              const char *idx, int seq)
+                              const char *idx, const char *value, int seq)
 {
     char tmp[KV_KEY + 1];
+    char val[MAX_VALUE + 1];
 
     memset(out, ' ', KV_KEY);
-    sprintf(tmp, "X|%-16.16s|%-16.16s|%06d", table, idx, seq);
+    strncpy(val, value, MAX_VALUE);
+    val[MAX_VALUE] = '\0';
+    clean_token(val);
+    sprintf(tmp, "X|%-16.16s|%-16.16s|%-18.18s|%06d",
+            table, idx, val, seq);
     memcpy(out, tmp, strlen(tmp));
+}
+
+static void kv_make_index_prefix(char *out, const char *table,
+                                 const char *idx, const char *value,
+                                 int *len)
+{
+    char tmp[KV_KEY + 1];
+    char val[MAX_VALUE + 1];
+
+    memset(out, ' ', KV_KEY);
+    strncpy(val, value, MAX_VALUE);
+    val[MAX_VALUE] = '\0';
+    clean_token(val);
+    sprintf(tmp, "X|%-16.16s|%-16.16s|%-18.18s|", table, idx, val);
+    memcpy(out, tmp, strlen(tmp));
+    *len = (int)strlen(tmp);
+}
+
+static int kv_index_slot(const char *key)
+{
+    char buf[KV_KEY + 1];
+    char *p;
+
+    memcpy(buf, key, KV_KEY);
+    buf[KV_KEY] = '\0';
+    rtrim(buf);
+    p = strrchr(buf, '|');
+    if (p == NULL) {
+        return -1;
+    }
+    return atoi(p + 1);
 }
 
 static void kv_make_prefix(char *out, const char *kind,
@@ -239,8 +302,8 @@ static int kv_close(void)
 
 static int kv_get(const char *key, char *data, int max)
 {
-    struct KvRec rec;
 #ifdef __MVS__
+    struct KvRec rec;
     int rc;
     if (!kv_open()) {
         return 0;
@@ -265,7 +328,7 @@ static int kv_get(const char *key, char *data, int max)
 #endif
 }
 
-static int kv_put(const char *key, const char *data)
+static int kv_put_raw(const char *key, const char *data)
 {
     struct KvRec rec;
 #ifdef __MVS__
@@ -300,7 +363,7 @@ static int kv_put(const char *key, const char *data)
 #endif
 }
 
-static int kv_delete(const char *key)
+static int kv_delete_raw(const char *key)
 {
 #ifdef __MVS__
     struct KvRec rec;
@@ -329,6 +392,251 @@ static int kv_delete(const char *key)
     }
     return 1;
 #endif
+}
+
+static void tx_key(char *out, const char *kind, int seq)
+{
+    kv_make_key(out, kind, "TX", seq);
+}
+
+static char hex_digit(int n)
+{
+    return (char)(n < 10 ? '0' + n : 'A' + n - 10);
+}
+
+static void key_to_hex(const char *key, char *out)
+{
+    int i;
+
+    for (i = 0; i < KV_KEY; i++) {
+        unsigned char c = (unsigned char)key[i];
+        out[i * 2] = hex_digit((c >> 4) & 0x0f);
+        out[i * 2 + 1] = hex_digit(c & 0x0f);
+    }
+    out[KV_KEY * 2] = '\0';
+}
+
+static int from_hex(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    return -1;
+}
+
+static int hex_to_key(const char *hex, char *key)
+{
+    int i;
+
+    if ((int)strlen(hex) < KV_KEY * 2) {
+        return 0;
+    }
+    for (i = 0; i < KV_KEY; i++) {
+        int hi = from_hex(hex[i * 2]);
+        int lo = from_hex(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            return 0;
+        }
+        key[i] = (char)((hi << 4) | lo);
+    }
+    return 1;
+}
+
+static int tx_clear_journal(int upto)
+{
+    int i;
+    char key[KV_KEY];
+
+    for (i = 1; i <= upto; i++) {
+        tx_key(key, "JK", i);
+        if (!kv_delete_raw(key)) {
+            return 0;
+        }
+        tx_key(key, "JT", i);
+        if (!kv_delete_raw(key)) {
+            return 0;
+        }
+        tx_key(key, "JD", i);
+        if (!kv_delete_raw(key)) {
+            return 0;
+        }
+    }
+    tx_key(key, "JN", -1);
+    if (!kv_delete_raw(key)) {
+        return 0;
+    }
+    tx_key(key, "JS", -1);
+    if (!kv_delete_raw(key)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int tx_rollback_to(int upto)
+{
+    int i;
+    char jkey[KV_KEY];
+
+    for (i = upto; i >= 1; i--) {
+        char hex[KV_KEY * 2 + 1];
+        char type[MAX_VALUE + 1];
+        char old[KV_DATA + 1];
+        char key[KV_KEY];
+
+        tx_key(jkey, "JK", i);
+        if (!kv_get(jkey, hex, sizeof(hex))) {
+            continue;
+        }
+        tx_key(jkey, "JT", i);
+        if (!kv_get(jkey, type, sizeof(type))) {
+            continue;
+        }
+        tx_key(jkey, "JD", i);
+        if (!kv_get(jkey, old, sizeof(old))) {
+            old[0] = '\0';
+        }
+        if (!hex_to_key(hex, key)) {
+            return 0;
+        }
+        if (eqi(type, "P")) {
+            if (!kv_put_raw(key, old)) {
+                return 0;
+            }
+        } else if (eqi(type, "D")) {
+            if (!kv_delete_raw(key)) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+    return tx_clear_journal(upto);
+}
+
+static int tx_recover(void)
+{
+    char key[KV_KEY];
+    char status[MAX_VALUE + 1];
+    char seqbuf[MAX_VALUE + 1];
+    int seq;
+
+    tx_key(key, "JS", -1);
+    if (!kv_get(key, status, sizeof(status)) || !eqi(status, "ACTIVE")) {
+        return 1;
+    }
+    tx_key(key, "JN", -1);
+    seq = kv_get(key, seqbuf, sizeof(seqbuf)) ? atoi(seqbuf) : 0;
+    return tx_rollback_to(seq);
+}
+
+static int tx_begin(int mode)
+{
+    char key[KV_KEY];
+
+    if (g_tx_active) {
+        return 0;
+    }
+    g_tx_active = 1;
+    g_tx_mode = mode;
+    g_tx_seq = 0;
+    tx_key(key, "JS", -1);
+    if (!kv_put_raw(key, "ACTIVE")) {
+        g_tx_active = 0;
+        g_tx_mode = TX_NONE;
+        return 0;
+    }
+    tx_key(key, "JN", -1);
+    if (!kv_put_raw(key, "0")) {
+        g_tx_active = 0;
+        g_tx_mode = TX_NONE;
+        return 0;
+    }
+    return 1;
+}
+
+static int tx_commit(void)
+{
+    int seq = g_tx_seq;
+
+    if (!g_tx_active) {
+        return 0;
+    }
+    if (!tx_clear_journal(seq)) {
+        return 0;
+    }
+    g_tx_active = 0;
+    g_tx_mode = TX_NONE;
+    g_tx_seq = 0;
+    return 1;
+}
+
+static int tx_rollback(void)
+{
+    int seq = g_tx_seq;
+
+    if (!g_tx_active) {
+        return 0;
+    }
+    if (!tx_rollback_to(seq)) {
+        return 0;
+    }
+    g_tx_active = 0;
+    g_tx_mode = TX_NONE;
+    g_tx_seq = 0;
+    return 1;
+}
+
+static int tx_log_before(const char *key)
+{
+    char old[KV_DATA + 1];
+    char hex[KV_KEY * 2 + 1];
+    char jkey[KV_KEY];
+    char seqbuf[MAX_VALUE + 1];
+    int existed;
+
+    if (!g_tx_active) {
+        return 1;
+    }
+    existed = kv_get(key, old, sizeof(old));
+    key_to_hex(key, hex);
+    g_tx_seq++;
+    tx_key(jkey, "JK", g_tx_seq);
+    if (!kv_put_raw(jkey, hex)) {
+        return 0;
+    }
+    tx_key(jkey, "JT", g_tx_seq);
+    if (!kv_put_raw(jkey, existed ? "P" : "D")) {
+        return 0;
+    }
+    tx_key(jkey, "JD", g_tx_seq);
+    if (!kv_put_raw(jkey, existed ? old : "")) {
+        return 0;
+    }
+    tx_key(jkey, "JN", -1);
+    sprintf(seqbuf, "%d", g_tx_seq);
+    return kv_put_raw(jkey, seqbuf);
+}
+
+static int kv_put(const char *key, const char *data)
+{
+    if (!tx_log_before(key)) {
+        return 0;
+    }
+    return kv_put_raw(key, data);
+}
+
+static int kv_delete(const char *key)
+{
+    if (!tx_log_before(key)) {
+        return 0;
+    }
+    return kv_delete_raw(key);
 }
 
 static int kv_scan(const char *prefix, int prefix_len,
@@ -475,7 +783,10 @@ static int line_starts_command(const char *s)
            starts_i(s, "SELECT") ||
            starts_i(s, "UPDATE") ||
            starts_i(s, "DELETE FROM") ||
-           starts_i(s, "DROP TABLE");
+           starts_i(s, "DROP TABLE") ||
+           starts_i(s, "BEGIN") ||
+           starts_i(s, "COMMIT") ||
+           starts_i(s, "ROLLBACK");
 }
 
 static void normalize_terminal_line(char *s, int max)
@@ -915,12 +1226,6 @@ static int parse_def_csv(char *text, char values[MAX_DEFS][MAX_DEF_TEXT + 1],
     return 1;
 }
 
-struct CatalogScan {
-    struct TableDef *tables;
-    int count;
-    int ok;
-};
-
 static int decode_table_def(struct TableDef *table, const char *data)
 {
     char buf[KV_DATA + 1];
@@ -1041,23 +1346,6 @@ static int decode_table_def(struct TableDef *table, const char *data)
         }
     }
     return c > 0;
-}
-
-static int catalog_cb(const char *key, const char *data, void *arg)
-{
-    struct CatalogScan *scan = (struct CatalogScan *)arg;
-
-    (void)key;
-    if (scan->count >= MAX_TABLES) {
-        scan->ok = 0;
-        return 0;
-    }
-    if (!decode_table_def(&scan->tables[scan->count], data)) {
-        scan->ok = 0;
-        return 0;
-    }
-    scan->count++;
-    return 1;
 }
 
 static int load_catalog(struct TableDef tables[], int *count)
@@ -1249,10 +1537,92 @@ static int parse_name_after(char *sql, const char *prefix, char *name)
 
 struct RowScan {
     struct TableDef *table;
-    struct Row *rows;
-    int count;
+    struct RowSet *set;
     int ok;
 };
+
+static void rowset_init(struct RowSet *set)
+{
+    set->rows = NULL;
+    set->count = 0;
+    set->cap = 0;
+}
+
+static void rowset_free(struct RowSet *set)
+{
+    if (set->rows != NULL) {
+        free(set->rows);
+    }
+    set->rows = NULL;
+    set->count = 0;
+    set->cap = 0;
+}
+
+static int rowset_reserve(struct RowSet *set, int need)
+{
+    struct Row *rows;
+    int cap;
+
+    if (need <= set->cap) {
+        return 1;
+    }
+    cap = set->cap == 0 ? ROWSET_INITIAL : set->cap;
+    while (cap < need) {
+        cap *= 2;
+    }
+    rows = (struct Row *)realloc(set->rows, sizeof(struct Row) * cap);
+    if (rows == NULL) {
+        return 0;
+    }
+    set->rows = rows;
+    set->cap = cap;
+    return 1;
+}
+
+static int rowset_add(struct RowSet *set, struct Row *row)
+{
+    if (!rowset_reserve(set, set->count + 1)) {
+        return 0;
+    }
+    set->rows[set->count++] = *row;
+    return 1;
+}
+
+static void keyset_init(struct KeySet *set)
+{
+    set->keys = NULL;
+    set->count = 0;
+    set->cap = 0;
+}
+
+static void keyset_free(struct KeySet *set)
+{
+    if (set->keys != NULL) {
+        free(set->keys);
+    }
+    set->keys = NULL;
+    set->count = 0;
+    set->cap = 0;
+}
+
+static int keyset_add(struct KeySet *set, const char *key)
+{
+    char (*keys)[KV_KEY];
+    int cap;
+
+    if (set->count >= set->cap) {
+        cap = set->cap == 0 ? ROWSET_INITIAL : set->cap * 2;
+        keys = (char (*)[KV_KEY])realloc(set->keys, KV_KEY * cap);
+        if (keys == NULL) {
+            return 0;
+        }
+        set->keys = keys;
+        set->cap = cap;
+    }
+    memcpy(set->keys[set->count], key, KV_KEY);
+    set->count++;
+    return 1;
+}
 
 static int row_cb(const char *key, const char *data, void *arg)
 {
@@ -1261,12 +1631,9 @@ static int row_cb(const char *key, const char *data, void *arg)
     char buf[KV_DATA + 1];
     int cnt = 0;
     int i;
+    struct Row row;
 
     (void)key;
-    if (scan->count >= MAX_ROWS) {
-        scan->ok = 0;
-        return 0;
-    }
     strncpy(buf, data, KV_DATA);
     buf[KV_DATA] = '\0';
     if (!parse_csv(buf, vals, &cnt) || cnt != scan->table->col_count) {
@@ -1274,42 +1641,31 @@ static int row_cb(const char *key, const char *data, void *arg)
         return 0;
     }
     for (i = 0; i < cnt; i++) {
-        strncpy(scan->rows[scan->count].values[i], vals[i], MAX_VALUE);
-        scan->rows[scan->count].values[i][MAX_VALUE] = '\0';
+        strncpy(row.values[i], vals[i], MAX_VALUE);
+        row.values[i][MAX_VALUE] = '\0';
     }
-    scan->count++;
+    if (!rowset_add(scan->set, &row)) {
+        scan->ok = 0;
+        return 0;
+    }
     return 1;
 }
 
-static int load_rows(struct TableDef *t, struct Row rows[], int *row_count)
+static int load_rows(struct TableDef *t, struct RowSet *set)
 {
-    int r;
-    int c;
-    int out = 0;
+    char prefix[KV_KEY];
+    int prefix_len;
+    struct RowScan scan;
 
-    for (r = 1; r <= MAX_ROWS; r++) {
-        char key[KV_KEY];
-        char data[KV_DATA + 1];
-        char vals[MAX_COLS][MAX_VALUE + 1];
-        int cnt = 0;
-
-        kv_make_key(key, "R", t->name, r);
-        if (!kv_get(key, data, sizeof(data))) {
-            continue;
-        }
-        if (out >= MAX_ROWS) {
-            return 0;
-        }
-        if (!parse_csv(data, vals, &cnt) || cnt != t->col_count) {
-            return 0;
-        }
-        for (c = 0; c < cnt; c++) {
-            strncpy(rows[out].values[c], vals[c], MAX_VALUE);
-            rows[out].values[c][MAX_VALUE] = '\0';
-        }
-        out++;
+    rowset_init(set);
+    kv_make_prefix(prefix, "R", t->name, &prefix_len);
+    scan.table = t;
+    scan.set = set;
+    scan.ok = 1;
+    if (!kv_scan(prefix, prefix_len, row_cb, &scan) || !scan.ok) {
+        rowset_free(set);
+        return 0;
     }
-    *row_count = out;
     return 1;
 }
 
@@ -1340,17 +1696,35 @@ static int load_row_slot(struct TableDef *t, int slot, struct Row *row,
 
 static int delete_index_rows(struct TableDef *t)
 {
+    struct KeySet keys;
+    char prefix[KV_KEY];
+    int prefix_len;
     int i;
-    int r;
 
-    for (i = 0; i < t->index_count; i++) {
-        for (r = 1; r <= MAX_ROWS; r++) {
-            char key[KV_KEY];
-            kv_make_index_key(key, t->name, t->index_names[i], r);
-            if (!kv_delete(key)) {
-                return 0;
-            }
+    keyset_init(&keys);
+    sprintf(prefix, "X|%-16.16s|", t->name);
+    prefix_len = 19;
+    if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
+        keyset_free(&keys);
+        return 0;
+    }
+    for (i = 0; i < keys.count; i++) {
+        if (!kv_delete(keys.keys[i])) {
+            keyset_free(&keys);
+            return 0;
         }
+    }
+    keyset_free(&keys);
+    return 1;
+}
+
+static int key_cb(const char *key, const char *data, void *arg)
+{
+    struct KeySet *keys = (struct KeySet *)arg;
+
+    (void)data;
+    if (!keyset_add(keys, key)) {
+        return 0;
     }
     return 1;
 }
@@ -1367,8 +1741,9 @@ static int rebuild_indexes(struct TableDef *t, struct Row rows[],
     for (i = 0; i < t->index_count; i++) {
         for (r = 0; r < row_count; r++) {
             char key[KV_KEY];
-            kv_make_index_key(key, t->name, t->index_names[i], r + 1);
-            if (!kv_put(key, rows[r].values[t->index_cols[i]])) {
+            kv_make_index_key(key, t->name, t->index_names[i],
+                              rows[r].values[t->index_cols[i]], r + 1);
+            if (!kv_put(key, "")) {
                 return 0;
             }
         }
@@ -1378,16 +1753,25 @@ static int rebuild_indexes(struct TableDef *t, struct Row rows[],
 
 static int save_rows(struct TableDef *t, struct Row rows[], int row_count)
 {
+    struct KeySet keys;
+    char prefix[KV_KEY];
+    int prefix_len;
     int r;
     int c;
 
-    for (r = 1; r <= MAX_ROWS; r++) {
-        char key[KV_KEY];
-        kv_make_key(key, "R", t->name, r);
-        if (!kv_delete(key)) {
+    keyset_init(&keys);
+    kv_make_prefix(prefix, "R", t->name, &prefix_len);
+    if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
+        keyset_free(&keys);
+        return 0;
+    }
+    for (r = 0; r < keys.count; r++) {
+        if (!kv_delete(keys.keys[r])) {
+            keyset_free(&keys);
             return 0;
         }
     }
+    keyset_free(&keys);
     for (r = 0; r < row_count; r++) {
         char key[KV_KEY];
         char data[KV_DATA + 1];
@@ -1424,8 +1808,7 @@ static int fk_value_exists(struct TableDef tables[], int count,
     int parent;
     int ref_col;
     int r;
-    int found;
-    struct Row row;
+    struct RowSet rows;
 
     parent = find_table(tables, count, child->fk_tables[fk_no]);
     if (parent < 0) {
@@ -1435,14 +1818,16 @@ static int fk_value_exists(struct TableDef tables[], int count,
     if (ref_col < 0 || tables[parent].pk_col != ref_col) {
         return 0;
     }
-    for (r = 1; r <= MAX_ROWS; r++) {
-        if (!load_row_slot(&tables[parent], r, &row, &found)) {
-            return 0;
-        }
-        if (found && eqi(row.values[ref_col], value)) {
+    if (!load_rows(&tables[parent], &rows)) {
+        return 0;
+    }
+    for (r = 0; r < rows.count; r++) {
+        if (eqi(rows.rows[r].values[ref_col], value)) {
+            rowset_free(&rows);
             return 1;
         }
     }
+    rowset_free(&rows);
     return 0;
 }
 
@@ -1475,23 +1860,23 @@ static int row_is_referenced(struct TableDef tables[], int count,
     for (t = 0; t < count; t++) {
         for (f = 0; f < tables[t].fk_count; f++) {
             int r;
-            int found;
-            struct Row row;
+            struct RowSet rows;
 
             if (!eqi(tables[t].fk_tables[f], parent->name) ||
                 !eqi(tables[t].fk_ref_cols[f],
                      parent->cols[parent->pk_col])) {
                 continue;
             }
-            for (r = 1; r <= MAX_ROWS; r++) {
-                if (!load_row_slot(&tables[t], r, &row, &found)) {
-                    return 1;
-                }
-                if (found &&
-                    eqi(row.values[tables[t].fk_cols[f]], value)) {
+            if (!load_rows(&tables[t], &rows)) {
+                return 1;
+            }
+            for (r = 0; r < rows.count; r++) {
+                if (eqi(rows.rows[r].values[tables[t].fk_cols[f]], value)) {
+                    rowset_free(&rows);
                     return 1;
                 }
             }
+            rowset_free(&rows);
         }
     }
     return 0;
@@ -1712,8 +2097,8 @@ static int parse_order_clause(struct TableDef *t, char *text, int group_col,
     return 1;
 }
 
-static int add_group_row(struct GroupRow groups[], int *group_count,
-                         const char *value)
+static int add_group_row(struct GroupRow groups[], int group_cap,
+                         int *group_count, const char *value)
 {
     int i;
 
@@ -1723,7 +2108,7 @@ static int add_group_row(struct GroupRow groups[], int *group_count,
             return 1;
         }
     }
-    if (*group_count >= MAX_ROWS) {
+    if (*group_count >= group_cap) {
         return 0;
     }
     strncpy(groups[*group_count].value, value, MAX_VALUE);
@@ -1731,6 +2116,237 @@ static int add_group_row(struct GroupRow groups[], int *group_count,
     groups[*group_count].count = 1;
     (*group_count)++;
     return 1;
+}
+
+static int parse_qualified_col(char *text, char *table, char *col)
+{
+    char buf[MAX_VALUE + 1];
+    char *dot;
+
+    strncpy(buf, text, MAX_VALUE);
+    buf[MAX_VALUE] = '\0';
+    clean_token(buf);
+    dot = strchr(buf, '.');
+    if (dot == NULL) {
+        return 0;
+    }
+    *dot = '\0';
+    strncpy(table, buf, MAX_NAME);
+    table[MAX_NAME] = '\0';
+    strncpy(col, dot + 1, MAX_NAME);
+    col[MAX_NAME] = '\0';
+    return valid_name(table) && valid_name(col);
+}
+
+static void print_join_header(struct TableDef *left, struct TableDef *right)
+{
+    int c;
+    int first = 1;
+
+    for (c = 0; c < left->col_count; c++) {
+        if (!first) {
+            printf(" | ");
+        }
+        printf("%s.%s", left->name, left->cols[c]);
+        first = 0;
+    }
+    for (c = 0; c < right->col_count; c++) {
+        if (!first) {
+            printf(" | ");
+        }
+        printf("%s.%s", right->name, right->cols[c]);
+        first = 0;
+    }
+    printf("\n");
+}
+
+static void print_join_row(struct TableDef *left, struct Row *lrow,
+                           struct TableDef *right, struct Row *rrow)
+{
+    int c;
+    int first = 1;
+
+    for (c = 0; c < left->col_count; c++) {
+        if (!first) {
+            printf(" | ");
+        }
+        printf("%s", lrow->values[c]);
+        first = 0;
+    }
+    for (c = 0; c < right->col_count; c++) {
+        if (!first) {
+            printf(" | ");
+        }
+        printf("%s", rrow->values[c]);
+        first = 0;
+    }
+    printf("\n");
+}
+
+static void cmd_select_join(struct TableDef tables[], int count, char *sql)
+{
+    char left_name[MAX_NAME + 1];
+    char right_name[MAX_NAME + 1];
+    char qleft_table[MAX_NAME + 1];
+    char qleft_col[MAX_NAME + 1];
+    char qright_table[MAX_NAME + 1];
+    char qright_col[MAX_NAME + 1];
+    char onbuf[MAX_STATEMENT];
+    char *p;
+    char *joinp;
+    char *onp;
+    char *eq;
+    int i;
+    int left_idx;
+    int right_idx;
+    int left_col;
+    int right_col;
+    int right_index;
+    int matched = 0;
+    struct RowSet left_rows;
+    struct RowSet right_rows;
+
+    p = ltrim(sql + strlen("SELECT"));
+    if (*p != '*') {
+        printf("ERR JOIN SUPPORTS SELECT *\n");
+        return;
+    }
+    p++;
+    p = ltrim(p);
+    if (!starts_i(p, "FROM")) {
+        printf("ERR BAD JOIN\n");
+        return;
+    }
+    p = ltrim(p + strlen("FROM"));
+    i = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            left_name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    left_name[i] = '\0';
+    joinp = find_keyword(p, "JOIN");
+    if (!valid_name(left_name) || joinp == NULL) {
+        printf("ERR BAD JOIN\n");
+        return;
+    }
+    p = ltrim(joinp + strlen("JOIN"));
+    i = 0;
+    while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
+        if (i < MAX_NAME) {
+            right_name[i++] = (char)toupper((unsigned char)*p);
+        }
+        p++;
+    }
+    right_name[i] = '\0';
+    onp = find_keyword(p, "ON");
+    if (!valid_name(right_name) || onp == NULL) {
+        printf("ERR BAD JOIN\n");
+        return;
+    }
+    strncpy(onbuf, onp + strlen("ON"), MAX_STATEMENT - 1);
+    onbuf[MAX_STATEMENT - 1] = '\0';
+    eq = strchr(onbuf, '=');
+    if (eq == NULL) {
+        printf("ERR BAD JOIN\n");
+        return;
+    }
+    *eq = '\0';
+    if (!parse_qualified_col(onbuf, qleft_table, qleft_col) ||
+        !parse_qualified_col(eq + 1, qright_table, qright_col)) {
+        printf("ERR BAD JOIN\n");
+        return;
+    }
+    left_idx = find_table(tables, count, left_name);
+    right_idx = find_table(tables, count, right_name);
+    if (left_idx < 0 || right_idx < 0) {
+        printf("ERR TABLE NOT FOUND\n");
+        return;
+    }
+    if (!eqi(qleft_table, left_name) || !eqi(qright_table, right_name)) {
+        printf("ERR JOIN ORDER\n");
+        return;
+    }
+    left_col = find_col(&tables[left_idx], qleft_col);
+    right_col = find_col(&tables[right_idx], qright_col);
+    if (left_col < 0 || right_col < 0) {
+        printf("ERR BAD JOIN COLUMN\n");
+        return;
+    }
+    if (!load_rows(&tables[left_idx], &left_rows)) {
+        printf("ERR CANNOT READ TABLE\n");
+        return;
+    }
+    right_index = find_index_col(&tables[right_idx], right_col);
+    print_join_header(&tables[left_idx], &tables[right_idx]);
+    if (right_index >= 0) {
+        int l;
+
+        for (l = 0; l < left_rows.count; l++) {
+            struct KeySet keys;
+            char prefix[KV_KEY];
+            int prefix_len;
+            int k;
+
+            keyset_init(&keys);
+            kv_make_index_prefix(prefix, tables[right_idx].name,
+                                 tables[right_idx].index_names[right_index],
+                                 left_rows.rows[l].values[left_col],
+                                 &prefix_len);
+            if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
+                keyset_free(&keys);
+                rowset_free(&left_rows);
+                printf("ERR CANNOT READ INDEX\n");
+                return;
+            }
+            for (k = 0; k < keys.count; k++) {
+                int slot = kv_index_slot(keys.keys[k]);
+                int found;
+                struct Row rrow;
+
+                if (slot < 1) {
+                    continue;
+                }
+                if (!load_row_slot(&tables[right_idx], slot, &rrow,
+                                   &found)) {
+                    keyset_free(&keys);
+                    rowset_free(&left_rows);
+                    printf("ERR CANNOT READ TABLE\n");
+                    return;
+                }
+                if (found && eqi(left_rows.rows[l].values[left_col],
+                                 rrow.values[right_col])) {
+                    print_join_row(&tables[left_idx], &left_rows.rows[l],
+                                   &tables[right_idx], &rrow);
+                    matched++;
+                }
+            }
+            keyset_free(&keys);
+        }
+    } else {
+        int l;
+        int r;
+
+        if (!load_rows(&tables[right_idx], &right_rows)) {
+            rowset_free(&left_rows);
+            printf("ERR CANNOT READ TABLE\n");
+            return;
+        }
+        for (l = 0; l < left_rows.count; l++) {
+            for (r = 0; r < right_rows.count; r++) {
+                if (eqi(left_rows.rows[l].values[left_col],
+                        right_rows.rows[r].values[right_col])) {
+                    print_join_row(&tables[left_idx], &left_rows.rows[l],
+                                   &tables[right_idx], &right_rows.rows[r]);
+                    matched++;
+                }
+            }
+        }
+        rowset_free(&right_rows);
+    }
+    rowset_free(&left_rows);
+    printf("OK %d ROWS\n", matched);
 }
 
 static void cmd_tables(struct TableDef tables[], int count)
@@ -2089,8 +2705,7 @@ static void cmd_create_index(struct TableDef tables[], int count, char *sql)
     int i = 0;
     int tidx;
     int cidx;
-    int row_count = 0;
-    struct Row rows[MAX_ROWS];
+    struct RowSet rows;
     p = sql + strlen("CREATE INDEX");
     p = ltrim(p);
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
@@ -2151,14 +2766,16 @@ static void cmd_create_index(struct TableDef tables[], int count, char *sql)
     tables[tidx].index_names[tables[tidx].index_count][MAX_NAME] = '\0';
     tables[tidx].index_cols[tables[tidx].index_count] = cidx;
     tables[tidx].index_count++;
-    if (!load_rows(&tables[tidx], rows, &row_count)) {
+    if (!load_rows(&tables[tidx], &rows)) {
         printf("ERR CANNOT READ TABLE\n");
         return;
     }
-    if (!rebuild_indexes(&tables[tidx], rows, row_count)) {
+    if (!rebuild_indexes(&tables[tidx], rows.rows, rows.count)) {
+        rowset_free(&rows);
         printf("ERR CANNOT WRITE INDEX\n");
         return;
     }
+    rowset_free(&rows);
     if (!save_catalog(tables, count)) {
         printf("ERR CANNOT WRITE CATALOG\n");
         return;
@@ -2175,8 +2792,7 @@ static void cmd_insert(struct TableDef tables[], int count, char *sql)
     int idx;
     int val_count = 0;
     int i;
-    int row_count = 0;
-    struct Row rows[MAX_ROWS];
+    struct RowSet rows;
     p = sql + strlen("INSERT INTO");
     p = ltrim(p);
     i = 0;
@@ -2214,36 +2830,43 @@ static void cmd_insert(struct TableDef tables[], int count, char *sql)
             return;
         }
     }
-    if (!load_rows(&tables[idx], rows, &row_count)) {
+    if (!load_rows(&tables[idx], &rows)) {
         printf("ERR CANNOT READ TABLE\n");
-        return;
-    }
-    if (row_count >= MAX_ROWS) {
-        printf("ERR TOO MANY ROWS\n");
         return;
     }
     if (tables[idx].pk_col >= 0) {
         if (vals[tables[idx].pk_col][0] == '\0') {
+            rowset_free(&rows);
             printf("ERR PRIMARY KEY REQUIRED\n");
             return;
         }
-        if (find_pk_duplicate(&tables[idx], rows, row_count,
+        if (find_pk_duplicate(&tables[idx], rows.rows, rows.count,
                               vals[tables[idx].pk_col], -1) >= 0) {
+            rowset_free(&rows);
             printf("ERR DUPLICATE PRIMARY KEY\n");
             return;
         }
     }
     if (!check_foreign_keys(tables, count, &tables[idx], vals)) {
+        rowset_free(&rows);
+        return;
+    }
+    if (!rowset_reserve(&rows, rows.count + 1)) {
+        rowset_free(&rows);
+        printf("ERR OUT OF MEMORY\n");
         return;
     }
     for (i = 0; i < val_count; i++) {
-        strncpy(rows[row_count].values[i], vals[i], MAX_VALUE);
-        rows[row_count].values[i][MAX_VALUE] = '\0';
+        strncpy(rows.rows[rows.count].values[i], vals[i], MAX_VALUE);
+        rows.rows[rows.count].values[i][MAX_VALUE] = '\0';
     }
-    if (!save_rows(&tables[idx], rows, row_count + 1)) {
+    rows.count++;
+    if (!save_rows(&tables[idx], rows.rows, rows.count)) {
+        rowset_free(&rows);
         printf("ERR CANNOT WRITE TABLE\n");
         return;
     }
+    rowset_free(&rows);
     printf("OK 1 ROW INSERTED\n");
 }
 
@@ -2258,8 +2881,6 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     int idx;
     int r;
     int c;
-    int row_count = 0;
-    int out_count = 0;
     int group_count = 0;
     int group_col = -1;
     int order_col = -1;
@@ -2278,12 +2899,20 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     char group_buf[MAX_STATEMENT];
     char order_buf[MAX_STATEMENT];
     struct WhereExpr expr;
-    struct Row rows[MAX_ROWS];
-    struct Row out[MAX_ROWS];
-    struct GroupRow groups[MAX_ROWS];
+    struct RowSet rows;
+    struct RowSet out;
+    struct GroupRow *groups;
+
+    rowset_init(&rows);
+    rowset_init(&out);
+    groups = NULL;
 
     if (!starts_i(sql, "SELECT")) {
         printf("ERR BAD SELECT\n");
+        return;
+    }
+    if (find_keyword(sql + strlen("SELECT"), "JOIN") != NULL) {
+        cmd_select_join(tables, count, sql);
         return;
     }
     p = find_keyword(sql + strlen("SELECT"), "FROM");
@@ -2407,45 +3036,63 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         index_no = -1;
     }
     if (index_no >= 0) {
-        for (r = 1; r <= MAX_ROWS; r++) {
-            char key[KV_KEY];
-            char val[MAX_VALUE + 1];
+        struct KeySet keys;
+        char prefix[KV_KEY];
+        int prefix_len;
+
+        keyset_init(&keys);
+        kv_make_index_prefix(prefix, tables[idx].name,
+                             tables[idx].index_names[index_no],
+                             where_val, &prefix_len);
+        if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
+            keyset_free(&keys);
+            printf("ERR CANNOT READ INDEX\n");
+            return;
+        }
+        for (r = 0; r < keys.count; r++) {
+            int slot;
             int found;
             struct Row row;
 
-            kv_make_index_key(key, tables[idx].name,
-                              tables[idx].index_names[index_no], r);
-            if (!kv_get(key, val, sizeof(val)) || !eqi(val, where_val)) {
+            slot = kv_index_slot(keys.keys[r]);
+            if (slot < 1) {
                 continue;
             }
-            if (!load_row_slot(&tables[idx], r, &row, &found)) {
+            if (!load_row_slot(&tables[idx], slot, &row, &found)) {
+                keyset_free(&keys);
+                rowset_free(&out);
                 printf("ERR CANNOT READ TABLE\n");
                 return;
             }
             if (!found || !where_match(&tables[idx], &row, &expr)) {
                 continue;
             }
-            if (out_count >= MAX_ROWS) {
-                printf("ERR TOO MANY ROWS\n");
+            if (!rowset_add(&out, &row)) {
+                keyset_free(&keys);
+                rowset_free(&out);
+                printf("ERR OUT OF MEMORY\n");
                 return;
             }
-            out[out_count++] = row;
         }
+        keyset_free(&keys);
     } else {
-        if (!load_rows(&tables[idx], rows, &row_count)) {
+        if (!load_rows(&tables[idx], &rows)) {
+            rowset_free(&out);
             printf("ERR CANNOT READ TABLE\n");
             return;
         }
-        for (r = 0; r < row_count; r++) {
-            if (!where_match(&tables[idx], &rows[r], &expr)) {
+        for (r = 0; r < rows.count; r++) {
+            if (!where_match(&tables[idx], &rows.rows[r], &expr)) {
                 continue;
             }
-            if (out_count >= MAX_ROWS) {
-                printf("ERR TOO MANY ROWS\n");
+            if (!rowset_add(&out, &rows.rows[r])) {
+                rowset_free(&rows);
+                rowset_free(&out);
+                printf("ERR OUT OF MEMORY\n");
                 return;
             }
-            out[out_count++] = rows[r];
         }
+        rowset_free(&rows);
     }
     if (group_col >= 0) {
         if (!select_all) {
@@ -2460,9 +3107,18 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
                 return;
             }
         }
-        for (r = 0; r < out_count; r++) {
-            if (!add_group_row(groups, &group_count,
-                               out[r].values[group_col])) {
+        groups = (struct GroupRow *)malloc(sizeof(struct GroupRow) *
+                                           (out.count > 0 ? out.count : 1));
+        if (groups == NULL) {
+            rowset_free(&out);
+            printf("ERR OUT OF MEMORY\n");
+            return;
+        }
+        for (r = 0; r < out.count; r++) {
+            if (!add_group_row(groups, out.count, &group_count,
+                               out.rows[r].values[group_col])) {
+                free(groups);
+                rowset_free(&out);
                 printf("ERR TOO MANY GROUPS\n");
                 return;
             }
@@ -2491,23 +3147,27 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
             }
         }
         printf("OK %d GROUPS\n", group_count);
+        free(groups);
+        rowset_free(&out);
         return;
     }
     if (select_count) {
         if (select_col_count > 0 || select_all) {
+            rowset_free(&out);
             printf("ERR BAD SELECT LIST\n");
             return;
         }
         printf("COUNT\n");
-        printf("%d\n", out_count);
+        printf("%d\n", out.count);
         printf("OK 1 ROWS\n");
+        rowset_free(&out);
         return;
     }
     if (order != NULL) {
         g_sort_table = &tables[idx];
         g_sort_col = order_col;
         g_sort_desc = order_desc;
-        qsort(out, out_count, sizeof(out[0]), cmp_row_qsort);
+        qsort(out.rows, out.count, sizeof(out.rows[0]), cmp_row_qsort);
     }
     if (select_all) {
         print_select_line(&tables[idx], NULL, 1);
@@ -2515,15 +3175,16 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         print_projected_line(&tables[idx], NULL, select_cols,
                              select_col_count, 1);
     }
-    for (r = 0; r < out_count; r++) {
+    for (r = 0; r < out.count; r++) {
         if (select_all) {
-            print_select_line(&tables[idx], &out[r], 0);
+            print_select_line(&tables[idx], &out.rows[r], 0);
         } else {
-            print_projected_line(&tables[idx], &out[r], select_cols,
+            print_projected_line(&tables[idx], &out.rows[r], select_cols,
                                  select_col_count, 0);
         }
     }
-    printf("OK %d ROWS\n", out_count);
+    printf("OK %d ROWS\n", out.count);
+    rowset_free(&out);
 }
 
 static int where_tokenize(char *text,
@@ -2693,12 +3354,10 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
     int idx;
     int i = 0;
     int r;
-    int kept = 0;
     int deleted = 0;
-    int row_count = 0;
     struct WhereExpr expr;
-    struct Row rows[MAX_ROWS];
-    struct Row out[MAX_ROWS];
+    struct RowSet rows;
+    struct RowSet out;
     p = sql + strlen("DELETE FROM");
     p = ltrim(p);
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
@@ -2718,27 +3377,39 @@ static void cmd_delete(struct TableDef tables[], int count, char *sql)
         printf("ERR BAD WHERE\n");
         return;
     }
-    if (!load_rows(&tables[idx], rows, &row_count)) {
+    if (!load_rows(&tables[idx], &rows)) {
         printf("ERR CANNOT READ TABLE\n");
         return;
     }
-    for (r = 0; r < row_count; r++) {
-        if (where_match(&tables[idx], &rows[r], &expr)) {
+    rowset_init(&out);
+    for (r = 0; r < rows.count; r++) {
+        if (where_match(&tables[idx], &rows.rows[r], &expr)) {
             if (tables[idx].pk_col >= 0 &&
                 row_is_referenced(tables, count, &tables[idx],
-                                  rows[r].values[tables[idx].pk_col])) {
+                                  rows.rows[r].values[tables[idx].pk_col])) {
+                rowset_free(&rows);
+                rowset_free(&out);
                 printf("ERR ROW REFERENCED\n");
                 return;
             }
             deleted++;
         } else {
-            out[kept++] = rows[r];
+            if (!rowset_add(&out, &rows.rows[r])) {
+                rowset_free(&rows);
+                rowset_free(&out);
+                printf("ERR OUT OF MEMORY\n");
+                return;
+            }
         }
     }
-    if (!save_rows(&tables[idx], out, kept)) {
+    if (!save_rows(&tables[idx], out.rows, out.count)) {
+        rowset_free(&rows);
+        rowset_free(&out);
         printf("ERR CANNOT WRITE TABLE\n");
         return;
     }
+    rowset_free(&rows);
+    rowset_free(&out);
     printf("OK %d ROWS DELETED\n", deleted);
 }
 
@@ -2757,8 +3428,7 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
     int i = 0;
     int r;
     int changed = 0;
-    int row_count = 0;
-    struct Row rows[MAX_ROWS];
+    struct RowSet rows;
     p = sql + strlen("UPDATE");
     p = ltrim(p);
     while (*p && (isalnum((unsigned char)*p) || *p == '_')) {
@@ -2813,25 +3483,28 @@ static void cmd_update(struct TableDef tables[], int count, char *sql)
         printf("ERR BAD WHERE\n");
         return;
     }
-    if (!load_rows(&tables[idx], rows, &row_count)) {
+    if (!load_rows(&tables[idx], &rows)) {
         printf("ERR CANNOT READ TABLE\n");
         return;
     }
-    for (r = 0; r < row_count; r++) {
-        if (where_match(&tables[idx], &rows[r], &expr)) {
-            strncpy(rows[r].values[set_col], set_val, MAX_VALUE);
-            rows[r].values[set_col][MAX_VALUE] = '\0';
+    for (r = 0; r < rows.count; r++) {
+        if (where_match(&tables[idx], &rows.rows[r], &expr)) {
+            strncpy(rows.rows[r].values[set_col], set_val, MAX_VALUE);
+            rows.rows[r].values[set_col][MAX_VALUE] = '\0';
             if (!check_foreign_keys(tables, count, &tables[idx],
-                                    rows[r].values)) {
+                                    rows.rows[r].values)) {
+                rowset_free(&rows);
                 return;
             }
             changed++;
         }
     }
-    if (!save_rows(&tables[idx], rows, row_count)) {
+    if (!save_rows(&tables[idx], rows.rows, rows.count)) {
+        rowset_free(&rows);
         printf("ERR CANNOT WRITE TABLE\n");
         return;
     }
+    rowset_free(&rows);
     printf("OK %d ROWS UPDATED\n", changed);
 }
 
@@ -2839,6 +3512,9 @@ static void cmd_drop(struct TableDef tables[], int *count, char *sql)
 {
     char name[MAX_NAME + 1];
     char key[KV_KEY];
+    char prefix[KV_KEY];
+    int prefix_len;
+    struct KeySet keys;
     int idx;
     int i;
 
@@ -2869,13 +3545,21 @@ static void cmd_drop(struct TableDef tables[], int *count, char *sql)
         printf("ERR CANNOT DELETE CATALOG\n");
         return;
     }
-    for (i = 1; i <= MAX_ROWS; i++) {
-        kv_make_key(key, "R", tables[idx].name, i);
-        if (!kv_delete(key)) {
+    keyset_init(&keys);
+    kv_make_prefix(prefix, "R", tables[idx].name, &prefix_len);
+    if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
+        keyset_free(&keys);
+        printf("ERR CANNOT DELETE TABLE\n");
+        return;
+    }
+    for (i = 0; i < keys.count; i++) {
+        if (!kv_delete(keys.keys[i])) {
+            keyset_free(&keys);
             printf("ERR CANNOT DELETE TABLE\n");
             return;
         }
     }
+    keyset_free(&keys);
     if (!delete_index_rows(&tables[idx])) {
         printf("ERR CANNOT DELETE INDEX\n");
         return;
@@ -2904,11 +3588,13 @@ static void cmd_help(void)
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
     printf("  SELECT *|cols|COUNT(*) FROM name [WHERE expression]\n");
     printf("    [GROUP BY col] [ORDER BY col|COUNT [ASC|DESC]];\n");
+    printf("  SELECT * FROM a JOIN b ON a.col=b.col;\n");
     printf("  WHERE: =, <, >, LIKE, BETWEEN, AND, OR\n");
     printf("  GROUP BY supports one column and returns column | COUNT\n");
     printf("  UPDATE name SET col=value WHERE expression;\n");
     printf("  DELETE FROM name WHERE expression;\n");
     printf("  DROP TABLE name;\n");
+    printf("  BEGIN; COMMIT; ROLLBACK;\n");
     printf("  .TABLES\n");
     printf("  .SCHEMA name\n");
     printf("  DESC name or DESCRIBE name\n");
@@ -2922,6 +3608,7 @@ static void execute(char *sql)
     int table_count = 0;
     char *s = trim(sql);
     int len = (int)strlen(s);
+    int implicit_tx = 0;
 
     if (len > 0 && s[len - 1] == ';') {
         s[len - 1] = '\0';
@@ -2934,9 +3621,44 @@ static void execute(char *sql)
         cmd_help();
         return;
     }
+    if (eqi(s, "BEGIN") || eqi(s, "BEGIN TRANSACTION")) {
+        if (!tx_begin(TX_USER)) {
+            printf("ERR TRANSACTION ACTIVE\n");
+            return;
+        }
+        printf("OK TRANSACTION BEGIN\n");
+        return;
+    }
+    if (eqi(s, "COMMIT")) {
+        if (!tx_commit()) {
+            printf("ERR NO TRANSACTION\n");
+            return;
+        }
+        printf("OK TRANSACTION COMMIT\n");
+        return;
+    }
+    if (eqi(s, "ROLLBACK")) {
+        if (!tx_rollback()) {
+            printf("ERR NO TRANSACTION\n");
+            return;
+        }
+        printf("OK TRANSACTION ROLLBACK\n");
+        return;
+    }
     if (!load_catalog(tables, &table_count)) {
         printf("ERR CANNOT READ CATALOG\n");
         return;
+    }
+
+    if (!g_tx_active &&
+        (starts_i(s, "CREATE TABLE") || starts_i(s, "CREATE INDEX") ||
+         starts_i(s, "INSERT INTO") || starts_i(s, "DELETE FROM") ||
+         starts_i(s, "UPDATE") || starts_i(s, "DROP TABLE"))) {
+        if (!tx_begin(TX_IMPLICIT)) {
+            printf("ERR CANNOT BEGIN TRANSACTION\n");
+            return;
+        }
+        implicit_tx = 1;
     }
 
     if (eqi(s, ".TABLES")) {
@@ -2962,6 +3684,11 @@ static void execute(char *sql)
     } else {
         printf("ERR UNKNOWN COMMAND\n");
     }
+    if (implicit_tx) {
+        if (!tx_commit()) {
+            printf("ERR CANNOT COMMIT TRANSACTION\n");
+        }
+    }
 }
 
 static int run_processor(int interactive)
@@ -2976,6 +3703,10 @@ static int run_processor(int interactive)
         printf("MINISQL TSO READY\n");
     } else {
         printf("MINISQL MVS READY\n");
+    }
+    if (!tx_recover()) {
+        printf("ERR CANNOT RECOVER TRANSACTION\n");
+        return 8;
     }
     printf("END STATEMENTS WITH ;  USE .QUIT TO EXIT\n");
 

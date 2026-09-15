@@ -28,6 +28,11 @@ SELECT * FROM PEOPLE GROUP BY CITY ORDER BY COUNT DESC;
 CREATE TABLE ORDERS (OID INT PRIMARY KEY, PERSON_ID INT,
 ITEM VARCHAR(8), FOREIGN KEY (PERSON_ID) REFERENCES PEOPLE(ID));
 INSERT INTO ORDERS VALUES (100, 1, 'BOOK');
+BEGIN;
+INSERT INTO ORDERS VALUES (101, 1, 'PEN');
+ROLLBACK;
+CREATE INDEX IDXPID ON ORDERS (PERSON_ID);
+SELECT * FROM PEOPLE JOIN ORDERS ON PEOPLE.ID=ORDERS.PERSON_ID;
 UPDATE PEOPLE SET CITY='RIJEKA' WHERE ID=1;
 DELETE FROM PEOPLE WHERE ID=1;
 DROP TABLE PEOPLE;
@@ -39,9 +44,60 @@ Utility commands:
 .TABLES
 .SCHEMA PEOPLE
 DESC PEOPLE
+BEGIN
+COMMIT
+ROLLBACK
 .HELP
 .QUIT
 ```
+
+## Transaction Support
+
+`BEGIN`, `COMMIT` and `ROLLBACK` provide a small KV-level transaction layer.
+Before each write or delete, minisql records the previous value in journal
+records in the same VSAM KSDS. `ROLLBACK` replays that journal backward and
+restores the prior state; `COMMIT` removes the journal records.
+
+Mutating statements outside an explicit transaction run inside an implicit
+transaction, so a single `CREATE`, `INSERT`, `UPDATE`, `DELETE` or `DROP`
+either finishes with its journal cleared or can be recovered on the next run.
+At startup, minisql checks for an active journal and rolls it back before
+reading the catalog.
+
+## Storage And Indexes
+
+Rows are no longer capped by a fixed 256-row array in the engine. Table scans
+load matching row records into dynamically growing rowsets, and row records
+are addressed through the six-digit row-slot portion of the VSAM key.
+Practical table size is therefore limited by VSAM space, available memory, and
+the `999999` row-slot key space.
+
+Secondary indexes are stored as their own sorted KV entries using the indexed
+value and row slot in the key. This lets equality predicates seek by prefix in
+the KSDS key order:
+
+```sql
+CREATE INDEX IDXCITY ON PEOPLE (CITY);
+SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
+```
+
+Indexes are maintained by rebuilding the table's secondary index records after
+row changes. This is simple and robust for small MVS/TK5 workloads, but it is
+not a SQLite-style page-level B-tree implementation.
+
+## Simple Joins
+
+minisql supports one equality inner join form:
+
+```sql
+SELECT * FROM PEOPLE JOIN ORDERS ON PEOPLE.ID=ORDERS.PERSON_ID;
+```
+
+The join prints qualified column names such as `PEOPLE.ID` and `ORDERS.OID`.
+When the right-hand join column has a secondary index, minisql uses that index
+for lookup; otherwise it falls back to a nested-loop scan. Joins currently do
+not support projections, aliases, `WHERE`, `ORDER BY`, `GROUP BY`, outer joins
+or more than two tables.
 
 Files:
 
@@ -307,6 +363,7 @@ The standard batch test is `jcl/MINISQL.jcl`. The job:
 - inserts two valid rows
 - tests `INT` validation and `VARCHAR` length validation
 - creates secondary index `IDXCITY` on column `CITY`
+- tests `BEGIN` and `ROLLBACK`
 - prints `.SCHEMA PEOPLE`
 - tests `DESC PEOPLE` and `DESCRIBE ORDERS`
 - tests `SELECT * FROM PEOPLE`
@@ -318,6 +375,7 @@ The standard batch test is `jcl/MINISQL.jcl`. The job:
 - tests `GROUP BY` on one column with automatic `COUNT`
 - creates `ORDERS` with a single-column foreign key to `PEOPLE(ID)`
 - tests valid and invalid foreign key inserts
+- creates a secondary index on `ORDERS(PERSON_ID)` and tests a simple join
 - tests delete protection for referenced parent rows
 - tests `UPDATE` and `DELETE`
 
@@ -543,7 +601,9 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
   one primary key and single-column foreign keys.
 - Maximum 32 tables.
 - Maximum 16 columns per table.
-- Maximum 256 rows per table.
+- Rows are loaded into dynamic in-memory rowsets. Stored row slots use the
+  six-digit row key space, so practical capacity is bounded by VSAM space,
+  memory, and the `999999` row-slot ceiling rather than a 256-row array.
 - Maximum 4 secondary indexes per table.
 - `PRIMARY KEY` supports one column only.
 - A table may define up to 4 single-column foreign keys.
@@ -560,6 +620,7 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
   `jcl/ALLOCVS.jcl`.
 - `SELECT` supports `*`, a comma-separated column list, or `COUNT(*)`.
 - `SELECT` supports optional `WHERE`, `GROUP BY` and `ORDER BY` clauses.
+- `SELECT * FROM a JOIN b ON a.col=b.col` supports one equality join.
 - `WHERE` supports `=`, `<`, `>`, `LIKE`, `BETWEEN`, `AND` and `OR`.
 - `WHERE` does not support parentheses, `NOT`, `<=`, `>=`, `<>`, `!=`, `IN`,
   `IS NULL`, or functions.
@@ -569,15 +630,19 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - Grouped `ORDER BY` supports the grouped column or `COUNT`.
 - `COUNT(*)` supports an optional `WHERE`; with `GROUP BY`, it counts each
   group.
+- `BEGIN`, `COMMIT` and `ROLLBACK` are supported. Mutating statements outside
+  an explicit transaction run in an implicit transaction. Startup recovery
+  rolls back an active journal left by an interrupted run.
 - `DESC table` and `DESCRIBE table` show columns, data types, key roles and
   foreign key references.
-- A secondary index is used only for `SELECT * FROM table WHERE col=value`
-  when an index exists on `col` and no `GROUP BY` or `ORDER BY` is used;
-  complex `WHERE` expressions use a linear scan.
+- A secondary index is used for `SELECT * FROM table WHERE col=value` when an
+  index exists on `col` and no `GROUP BY` or `ORDER BY` is used. Simple joins
+  use an index on the right-hand join column when available; complex `WHERE`
+  expressions use a linear scan.
 - `UPDATE` supports one `SET col=value` and an optional `WHERE` expression.
 - `DELETE` supports an optional `WHERE` expression; without `WHERE`, it deletes
   all rows in the table.
-- There are no joins, general aggregate functions, views, stored
-  procedures, transactions, rollback, or recovery log.
+- There are no outer joins, multi-table planners, general aggregate functions,
+  views, stored procedures, triggers, page-level B-trees or WAL mode.
 - `MSQLTSO` is an interactive foreground TSO program. Use `MINISQL`, not
   `MSQLTSO`, for batch SQL.
