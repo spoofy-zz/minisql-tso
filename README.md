@@ -47,6 +47,7 @@ DESC PEOPLE
 BEGIN
 COMMIT
 ROLLBACK
+.CLEAR
 .HELP
 .QUIT
 ```
@@ -98,6 +99,14 @@ When the right-hand join column has a secondary index, minisql uses that index
 for lookup; otherwise it falls back to a nested-loop scan. Joins currently do
 not support projections, aliases, `WHERE`, `ORDER BY`, `GROUP BY`, outer joins
 or more than two tables.
+
+## Interactive Screen Clear
+
+`.CLEAR`, `//CLEAR` or `CLEAR` clears the interactive display and writes a
+fresh `SQL> ` prompt immediately. On ANSI-capable local terminals, minisql
+uses the standard clear-screen and home-cursor escape sequence. Under the TSO
+line-mode wrapper, minisql refreshes the display with blank lines and then
+writes the prompt through `TPUT`.
 
 Files:
 
@@ -497,6 +506,7 @@ SELECT * FROM PEOPLE WHERE NAME LIKE 'P%' OR CITY='SPLIT';
 SELECT * FROM PEOPLE ORDER BY AGE DESC;
 SELECT * FROM PEOPLE GROUP BY CITY ORDER BY COUNT DESC;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
+//CLEAR
 UPDATE PEOPLE SET CITY='SISAK' WHERE ID=3;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
 SELECT * FROM PEOPLE WHERE CITY='SISAK';
@@ -518,6 +528,8 @@ Expected behavior:
 - duplicate `ID=3` returns `ERR DUPLICATE PRIMARY KEY`.
 - changing a primary key column returns `ERR CANNOT UPDATE PRIMARY KEY`.
 - changing a non-key column such as `CITY` works and rebuilds indexes.
+- `CLEAR`, `.CLEAR` or `//CLEAR` refreshes the interactive display and leaves a
+  new `SQL> ` prompt ready for input.
 
 At the end, release the DD if you started `MSQLTSO` manually:
 

@@ -118,6 +118,8 @@ static int g_group_sort_by_count = 0;
 static int g_tx_active = 0;
 static int g_tx_mode = TX_NONE;
 static int g_tx_seq = 0;
+static int g_interactive = 0;
+static int g_prompt_written = 0;
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
 static char g_tso_out[MAX_LINE];
@@ -773,6 +775,9 @@ static int line_starts_command(const char *s)
            starts_i(s, ".HELP") ||
            starts_i(s, "//HELP") ||
            starts_i(s, "HELP") ||
+           starts_i(s, ".CLEAR") ||
+           starts_i(s, "//CLEAR") ||
+           starts_i(s, "CLEAR") ||
            starts_i(s, ".TABLES") ||
            starts_i(s, ".SCHEMA") ||
            starts_i(s, "DESC") ||
@@ -3595,11 +3600,36 @@ static void cmd_help(void)
     printf("  DELETE FROM name WHERE expression;\n");
     printf("  DROP TABLE name;\n");
     printf("  BEGIN; COMMIT; ROLLBACK;\n");
+    printf("  .CLEAR or //CLEAR\n");
     printf("  .TABLES\n");
     printf("  .SCHEMA name\n");
     printf("  DESC name or DESCRIBE name\n");
     printf("  .HELP or //HELP\n");
     printf("  .QUIT\n");
+}
+
+static void write_prompt(void)
+{
+    if (!g_interactive) {
+        return;
+    }
+    printf("SQL> ");
+    fflush(stdout);
+    g_prompt_written = 1;
+}
+
+static void cmd_clear(void)
+{
+#if defined(__MVS__) && defined(MINISQL_TSO)
+    int i;
+
+    for (i = 0; i < 24; i++) {
+        printf("\n");
+    }
+#else
+    printf("\033[2J\033[H");
+#endif
+    write_prompt();
 }
 
 static void execute(char *sql)
@@ -3619,6 +3649,10 @@ static void execute(char *sql)
     }
     if (eqi(s, ".HELP") || eqi(s, "//HELP") || eqi(s, "HELP")) {
         cmd_help();
+        return;
+    }
+    if (eqi(s, ".CLEAR") || eqi(s, "//CLEAR") || eqi(s, "CLEAR")) {
+        cmd_clear();
         return;
     }
     if (eqi(s, "BEGIN") || eqi(s, "BEGIN TRANSACTION")) {
@@ -3698,6 +3732,8 @@ static int run_processor(int interactive)
     char *p;
     int got_line;
 
+    g_interactive = interactive;
+    g_prompt_written = 0;
     stmt[0] = '\0';
     if (interactive) {
         printf("MINISQL TSO READY\n");
@@ -3711,8 +3747,7 @@ static int run_processor(int interactive)
     printf("END STATEMENTS WITH ;  USE .QUIT TO EXIT\n");
 
     if (interactive) {
-        printf("SQL> ");
-        fflush(stdout);
+        write_prompt();
     }
     while (1) {
 #if defined(__MVS__) && defined(MINISQL_TSO)
@@ -3731,15 +3766,13 @@ static int run_processor(int interactive)
         p = trim(line);
         if (line_is_empty_input(p)) {
             if (interactive) {
-                printf("SQL> ");
-                fflush(stdout);
+                write_prompt();
             }
             continue;
         }
         if (interactive && stmt[0] == '\0' &&
             !line_starts_command(p) && strchr(p, ';') == NULL) {
-            printf("SQL> ");
-            fflush(stdout);
+            write_prompt();
             continue;
         }
         if (eqi(p, ".QUIT") || eqi(p, "//QUIT") || eqi(p, "QUIT")) {
@@ -3759,11 +3792,11 @@ static int run_processor(int interactive)
         }
         strcat(stmt, p);
         if (strchr(p, ';') != NULL || p[0] == '.') {
+            g_prompt_written = 0;
             execute(stmt);
             stmt[0] = '\0';
-            if (interactive) {
-                printf("SQL> ");
-                fflush(stdout);
+            if (interactive && !g_prompt_written) {
+                write_prompt();
             }
         }
     }
