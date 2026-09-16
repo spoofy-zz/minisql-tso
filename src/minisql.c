@@ -10,6 +10,7 @@
 #if defined(__MVS__) && defined(MINISQL_TSO)
 extern int msqtget(char *buf, int max) asm("MSQTGET");
 extern int msqtput(char *buf, int len) asm("MSQTPUT");
+extern int msqtclr(void) asm("MSQTCLR");
 #endif
 
 #define MAX_LINE 1024
@@ -113,6 +114,8 @@ static void clean_token(char *s);
 static int eqi(const char *a, const char *b);
 static int parse_where(struct TableDef *t, char *where_text,
                        struct WhereExpr *expr);
+static int where_tokenize(char *text,
+                          char toks[][MAX_VALUE + 1], int *count);
 static int validate_value(struct TableDef *t, int col, const char *value);
 static void cmd_select_join(struct TableDef tables[], int count, char *sql);
 static void cmd_explain(struct TableDef tables[], int count, char *sql);
@@ -1903,23 +1906,38 @@ static int row_is_referenced(struct TableDef tables[], int count,
     return 0;
 }
 
-static void print_select_line(struct TableDef *t, struct Row *row, int header)
+/* Measure before printing so every PIPE stays in the same position. */
+static void measure_cell(int *width, const char *value)
 {
-    char line[MAX_LINE];
-    int c;
+    int len = (int)strlen(value);
+    if (len > *width) {
+        *width = len;
+    }
+}
 
-    line[0] = '\0';
-    for (c = 0; c < t->col_count; c++) {
+static void print_cell(const char *value, int width, int last)
+{
+    if (last) {
+        printf("%s\n", value);
+    } else {
+        printf("%-*s | ", width, value);
+    }
+}
+
+static void print_header_rule(int widths[], int col_count)
+{
+    int c;
+    int i;
+
+    for (c = 0; c < col_count; c++) {
         if (c > 0) {
-            strcat(line, " | ");
+            printf("-|");
         }
-        if (header) {
-            strcat(line, t->cols[c]);
-        } else {
-            strcat(line, row->values[c]);
+        for (i = 0; i < widths[c] + (c > 0 ? 1 : 0); i++) {
+            printf("-");
         }
     }
-    printf("%s\n", line);
+    printf("\n");
 }
 
 static int is_count_expr(const char *s)
@@ -1948,23 +1966,18 @@ static char *find_keyword(char *s, const char *keyword)
 }
 
 static void print_projected_line(struct TableDef *t, struct Row *row,
-                                 int cols[], int col_count, int header)
+                                 int cols[], int col_count, int header,
+                                 int widths[])
 {
-    char line[MAX_LINE];
     int i;
 
-    line[0] = '\0';
     for (i = 0; i < col_count; i++) {
-        if (i > 0) {
-            strcat(line, " | ");
-        }
-        if (header) {
-            strcat(line, t->cols[cols[i]]);
-        } else {
-            strcat(line, row->values[cols[i]]);
-        }
+        print_cell(header ? t->cols[cols[i]] : row->values[cols[i]],
+                   widths[i], i == col_count - 1);
     }
-    printf("%s\n", line);
+    if (header) {
+        print_header_rule(widths, col_count);
+    }
 }
 
 static int parse_select_list(struct TableDef *t, char *text, int cols[],
@@ -2281,78 +2294,42 @@ static int parse_join_select_list(char *text, struct TableDef *left,
 static void print_join_header(struct TableDef *left, const char *left_alias,
                               struct TableDef *right, const char *right_alias,
                               struct JoinProj projs[], int proj_count,
-                              int select_all)
+                              int widths[], int measure)
 {
     int c;
-    int first = 1;
+    char label[MAX_NAME * 2 + 2];
 
-    if (!select_all) {
-        for (c = 0; c < proj_count; c++) {
-            struct TableDef *t = projs[c].source == 0 ? left : right;
-            const char *alias = projs[c].source == 0 ? left_alias :
-                right_alias;
-            if (!first) {
-                printf(" | ");
-            }
-            printf("%s.%s", alias[0] != '\0' ? alias : t->name,
-                   t->cols[projs[c].col]);
-            first = 0;
+    for (c = 0; c < proj_count; c++) {
+        struct TableDef *t = projs[c].source == 0 ? left : right;
+        const char *alias = projs[c].source == 0 ? left_alias : right_alias;
+        sprintf(label, "%s.%s", alias[0] != '\0' ? alias : t->name,
+                t->cols[projs[c].col]);
+        if (measure) {
+            widths[c] = (int)strlen(label);
+        } else {
+            print_cell(label, widths[c], c == proj_count - 1);
         }
-        printf("\n");
-        return;
     }
-    for (c = 0; c < left->col_count; c++) {
-        if (!first) {
-            printf(" | ");
-        }
-        printf("%s.%s", left->name, left->cols[c]);
-        first = 0;
+    if (!measure) {
+        print_header_rule(widths, proj_count);
     }
-    for (c = 0; c < right->col_count; c++) {
-        if (!first) {
-            printf(" | ");
-        }
-        printf("%s.%s", right->name, right->cols[c]);
-        first = 0;
-    }
-    printf("\n");
 }
 
-static void print_join_row(struct TableDef *left, struct Row *lrow,
-                           struct TableDef *right, struct Row *rrow,
+static void print_join_row(struct Row *lrow, struct Row *rrow,
                            struct JoinProj projs[], int proj_count,
-                           int select_all)
+                           int widths[], int measure)
 {
     int c;
-    int first = 1;
 
-    if (!select_all) {
-        for (c = 0; c < proj_count; c++) {
-            struct Row *row = projs[c].source == 0 ? lrow : rrow;
-            if (!first) {
-                printf(" | ");
-            }
-            printf("%s", row->values[projs[c].col]);
-            first = 0;
+    for (c = 0; c < proj_count; c++) {
+        struct Row *row = projs[c].source == 0 ? lrow : rrow;
+        const char *value = row->values[projs[c].col];
+        if (measure) {
+            measure_cell(&widths[c], value);
+        } else {
+            print_cell(value, widths[c], c == proj_count - 1);
         }
-        printf("\n");
-        return;
     }
-    for (c = 0; c < left->col_count; c++) {
-        if (!first) {
-            printf(" | ");
-        }
-        printf("%s", lrow->values[c]);
-        first = 0;
-    }
-    for (c = 0; c < right->col_count; c++) {
-        if (!first) {
-            printf(" | ");
-        }
-        printf("%s", rrow->values[c]);
-        first = 0;
-    }
-    printf("\n");
 }
 
 static void cmd_select_join(struct TableDef tables[], int count, char *sql)
@@ -2367,6 +2344,7 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
     char qright_col[MAX_NAME + 1];
     char select_buf[MAX_STATEMENT];
     char onbuf[MAX_STATEMENT];
+    char wherebuf[MAX_STATEMENT];
     char *p;
     char *fromp;
     char *joinp;
@@ -2378,7 +2356,12 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
     int left_col;
     int right_col;
     int right_index;
+    int widths[MAX_JOIN_COLS];
+    int pass;
     int matched = 0;
+    int has_where = 0;
+    int where_source = -1;
+    struct WhereExpr where_expr;
     int select_all = 0;
     int proj_count = 0;
     struct JoinProj projs[MAX_JOIN_COLS];
@@ -2429,6 +2412,16 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
     }
     strncpy(onbuf, onp + strlen("ON"), MAX_STATEMENT - 1);
     onbuf[MAX_STATEMENT - 1] = '\0';
+    {
+        char *wherep = find_keyword(onbuf, "WHERE");
+        if (wherep != NULL) {
+            strncpy(wherebuf, wherep + strlen("WHERE"), MAX_STATEMENT - 1);
+            wherebuf[MAX_STATEMENT - 1] = '\0';
+            *wherep = '\0';
+            rtrim(onbuf);
+            has_where = 1;
+        }
+    }
     eq = strchr(onbuf, '=');
     if (eq == NULL) {
         printf("ERR BAD JOIN\n");
@@ -2445,6 +2438,41 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
     if (left_idx < 0 || right_idx < 0) {
         printf("ERR TABLE NOT FOUND\n");
         return;
+    }
+    if (has_where) {
+        char toks[MAX_CONDS * 5][MAX_VALUE + 1];
+        int ntok = 0;
+        char qtable[MAX_NAME + 1];
+        char qcol[MAX_NAME + 1];
+        char local_where[MAX_STATEMENT];
+        char *wt = ltrim(wherebuf);
+        if (!where_tokenize(wt, toks, &ntok) || ntok < 1 ||
+            !parse_qualified_col(toks[0], qtable, qcol)) {
+            printf("ERR BAD WHERE\n");
+            return;
+        }
+        if (name_matches(qtable, tables[left_idx].name, left_alias)) {
+            where_source = 0;
+            strncpy(local_where, wt, MAX_STATEMENT - 1);
+        } else if (name_matches(qtable, tables[right_idx].name, right_alias)) {
+            where_source = 1;
+            strncpy(local_where, wt, MAX_STATEMENT - 1);
+        } else {
+            printf("ERR BAD WHERE\n");
+            return;
+        }
+        local_where[MAX_STATEMENT - 1] = '\0';
+        /* Replace the qualified column with its table-local name. */
+        {
+            char rebuilt[MAX_STATEMENT];
+            const char *rest = local_where + strlen(toks[0]);
+            sprintf(rebuilt, "%s%s", qcol, rest);
+            if (!parse_where(where_source == 0 ? &tables[left_idx] :
+                             &tables[right_idx], rebuilt, &where_expr)) {
+                printf("ERR BAD WHERE\n");
+                return;
+            }
+        }
     }
     if (!name_matches(qleft_table, left_name, left_alias) ||
         !name_matches(qright_table, right_name, right_alias)) {
@@ -2468,73 +2496,104 @@ static void cmd_select_join(struct TableDef tables[], int count, char *sql)
         return;
     }
     right_index = find_index_col(&tables[right_idx], right_col);
-    print_join_header(&tables[left_idx], left_alias, &tables[right_idx],
-                      right_alias, projs, proj_count, select_all);
-    if (right_index >= 0) {
-        int l;
+    if (select_all) {
+        proj_count = 0;
+        for (i = 0; i < tables[left_idx].col_count; i++) {
+            projs[proj_count].source = 0;
+            projs[proj_count++].col = i;
+        }
+        for (i = 0; i < tables[right_idx].col_count; i++) {
+            projs[proj_count].source = 1;
+            projs[proj_count++].col = i;
+        }
+    }
+    /* First pass measures matching rows without retaining the join result. */
+    for (pass = 0; pass < 2; pass++) {
+        print_join_header(&tables[left_idx], select_all ? "" : left_alias,
+                          &tables[right_idx], select_all ? "" : right_alias,
+                          projs, proj_count, widths, pass == 0);
+        if (right_index >= 0) {
+            int l;
 
-        for (l = 0; l < left_rows.count; l++) {
-            struct KeySet keys;
-            char prefix[KV_KEY];
-            int prefix_len;
-            int k;
+            for (l = 0; l < left_rows.count; l++) {
+                struct KeySet keys;
+                char prefix[KV_KEY];
+                int prefix_len;
+                int k;
 
-            keyset_init(&keys);
-            kv_make_index_base_prefix(prefix, tables[right_idx].name,
-                                      tables[right_idx].index_names[right_index],
-                                      &prefix_len);
-            if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
-                keyset_free(&keys);
-                rowset_free(&left_rows);
-                printf("ERR CANNOT READ INDEX\n");
-                return;
-            }
-            for (k = 0; k < keys.count; k++) {
-                int slot = kv_index_slot(keys.keys[k]);
-                int found;
-                struct Row rrow;
-
-                if (slot < 1) {
-                    continue;
-                }
-                if (!load_row_slot(&tables[right_idx], slot, &rrow,
-                                   &found)) {
+                keyset_init(&keys);
+                kv_make_index_base_prefix(prefix, tables[right_idx].name,
+                                          tables[right_idx].index_names[right_index],
+                                          &prefix_len);
+                if (!kv_scan(prefix, prefix_len, key_cb, &keys)) {
                     keyset_free(&keys);
                     rowset_free(&left_rows);
-                    printf("ERR CANNOT READ TABLE\n");
+                    printf("ERR CANNOT READ INDEX\n");
                     return;
                 }
-                if (found && eqi(left_rows.rows[l].values[left_col],
-                                 rrow.values[right_col])) {
-                    print_join_row(&tables[left_idx], &left_rows.rows[l],
-                                   &tables[right_idx], &rrow, projs,
-                                   proj_count, select_all);
-                    matched++;
-                }
-            }
-            keyset_free(&keys);
-        }
-    } else {
-        int l;
-        int r;
+                for (k = 0; k < keys.count; k++) {
+                    int slot = kv_index_slot(keys.keys[k]);
+                    int found;
+                    struct Row rrow;
 
-        if (!load_rows(&tables[right_idx], &right_rows)) {
-            rowset_free(&left_rows);
-            printf("ERR CANNOT READ TABLE\n");
-            return;
-        }
-        for (l = 0; l < left_rows.count; l++) {
-            for (r = 0; r < right_rows.count; r++) {
-                if (eqi(left_rows.rows[l].values[left_col],
-                        right_rows.rows[r].values[right_col])) {
-                    print_join_row(&tables[left_idx], &left_rows.rows[l],
-                                   &tables[right_idx], &right_rows.rows[r],
-                                   projs, proj_count, select_all);
-                    matched++;
+                    if (slot < 1) {
+                        continue;
+                    }
+                    if (!load_row_slot(&tables[right_idx], slot, &rrow,
+                                       &found)) {
+                        keyset_free(&keys);
+                        rowset_free(&left_rows);
+                        printf("ERR CANNOT READ TABLE\n");
+                        return;
+                    }
+                    if (found && eqi(left_rows.rows[l].values[left_col],
+                                     rrow.values[right_col])) {
+                        if (has_where &&
+                            !where_match(where_source == 0 ? &tables[left_idx] :
+                                         &tables[right_idx],
+                                         where_source == 0 ? &left_rows.rows[l] :
+                                         &rrow, &where_expr)) {
+                            continue;
+                        }
+                        print_join_row(&left_rows.rows[l], &rrow, projs,
+                                       proj_count, widths, pass == 0);
+                        if (pass != 0) {
+                            matched++;
+                        }
+                    }
+                }
+                keyset_free(&keys);
+            }
+        } else {
+            int l;
+            int r;
+
+            if (!load_rows(&tables[right_idx], &right_rows)) {
+                rowset_free(&left_rows);
+                printf("ERR CANNOT READ TABLE\n");
+                return;
+            }
+            for (l = 0; l < left_rows.count; l++) {
+                for (r = 0; r < right_rows.count; r++) {
+                    if (eqi(left_rows.rows[l].values[left_col],
+                            right_rows.rows[r].values[right_col])) {
+                        if (has_where &&
+                            !where_match(where_source == 0 ? &tables[left_idx] :
+                                         &tables[right_idx],
+                                         where_source == 0 ? &left_rows.rows[l] :
+                                         &right_rows.rows[r], &where_expr)) {
+                            continue;
+                        }
+                        print_join_row(&left_rows.rows[l], &right_rows.rows[r],
+                                       projs, proj_count, widths, pass == 0);
+                        if (pass != 0) {
+                            matched++;
+                        }
+                    }
                 }
             }
+            rowset_free(&right_rows);
         }
-        rowset_free(&right_rows);
     }
     rowset_free(&left_rows);
     printf("OK %d ROWS\n", matched);
@@ -3130,6 +3189,10 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
     int order_count = 0;
     int order_desc = 0;
     int limit_count = -1;
+    int widths[MAX_COLS];
+    int group_width;
+    int count_width;
+    char count_text[32];
     int select_cols[MAX_COLS];
     int select_col_count = 0;
     int select_all = 0;
@@ -3403,17 +3466,31 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
             g_group_sort_by_count = order_count;
             qsort(groups, group_count, sizeof(groups[0]), cmp_group_qsort);
         }
+        count_width = 5;
+        group_width = (int)strlen(tables[idx].cols[group_col]);
+        for (r = 0; r < group_count &&
+             (limit_count < 0 || r < limit_count); r++) {
+            measure_cell(&group_width, groups[r].value);
+            sprintf(count_text, "%d", groups[r].count);
+            measure_cell(&count_width, count_text);
+        }
         if (select_all || (select_col_count > 0 && select_count)) {
-            printf("%s | COUNT\n", tables[idx].cols[group_col]);
+            printf("%-*s | COUNT\n", group_width, tables[idx].cols[group_col]);
+            widths[0] = group_width;
+            widths[1] = count_width;
+            print_header_rule(widths, 2);
         } else if (select_count) {
             printf("COUNT\n");
+            print_header_rule(&count_width, 1);
         } else {
             printf("%s\n", tables[idx].cols[group_col]);
+            print_header_rule(&group_width, 1);
         }
         for (r = 0; r < group_count &&
              (limit_count < 0 || r < limit_count); r++) {
             if (select_all || (select_col_count > 0 && select_count)) {
-                printf("%s | %d\n", groups[r].value, groups[r].count);
+                printf("%-*s | %d\n", group_width, groups[r].value,
+                       groups[r].count);
             } else if (select_count) {
                 printf("%d\n", groups[r].count);
             } else {
@@ -3433,7 +3510,11 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
             printf("ERR BAD SELECT LIST\n");
             return;
         }
+        count_width = 5;
+        sprintf(count_text, "%d", out.count);
+        measure_cell(&count_width, count_text);
         printf("COUNT\n");
+        print_header_rule(&count_width, 1);
         printf("%d\n", out.count);
         printf("OK 1 ROWS\n");
         rowset_free(&out);
@@ -3446,18 +3527,23 @@ static void cmd_select(struct TableDef tables[], int count, char *sql)
         qsort(out.rows, out.count, sizeof(out.rows[0]), cmp_row_qsort);
     }
     if (select_all) {
-        print_select_line(&tables[idx], NULL, 1);
-    } else {
-        print_projected_line(&tables[idx], NULL, select_cols,
-                             select_col_count, 1);
-    }
-    for (r = 0; r < out.count && (limit_count < 0 || r < limit_count); r++) {
-        if (select_all) {
-            print_select_line(&tables[idx], &out.rows[r], 0);
-        } else {
-            print_projected_line(&tables[idx], &out.rows[r], select_cols,
-                                 select_col_count, 0);
+        select_col_count = tables[idx].col_count;
+        for (c = 0; c < select_col_count; c++) {
+            select_cols[c] = c;
         }
+    }
+    for (c = 0; c < select_col_count; c++) {
+        widths[c] = (int)strlen(tables[idx].cols[select_cols[c]]);
+        for (r = 0; r < out.count &&
+             (limit_count < 0 || r < limit_count); r++) {
+            measure_cell(&widths[c], out.rows[r].values[select_cols[c]]);
+        }
+    }
+    print_projected_line(&tables[idx], NULL, select_cols,
+                         select_col_count, 1, widths);
+    for (r = 0; r < out.count && (limit_count < 0 || r < limit_count); r++) {
+        print_projected_line(&tables[idx], &out.rows[r], select_cols,
+                             select_col_count, 0, widths);
     }
     printf("OK %d ROWS\n",
            limit_count >= 0 && out.count > limit_count ?
@@ -4113,10 +4199,9 @@ static void write_prompt(void)
 static void cmd_clear(void)
 {
 #if defined(__MVS__) && defined(MINISQL_TSO)
-    int i;
-
-    for (i = 0; i < 24; i++) {
-        printf("\n");
+    tso_flush_line();
+    if (msqtclr() != 0) {
+        printf("ERR CANNOT RESET TERMINAL SCREEN\n");
     }
 #else
     printf("\033[2J\033[H");
@@ -4274,6 +4359,12 @@ static int run_processor(int interactive)
         }
         if (eqi(p, ".QUIT") || eqi(p, "//QUIT") || eqi(p, "QUIT")) {
             break;
+        }
+        if (eqi(p, "CLEAR") || eqi(p, ".CLEAR") || eqi(p, "//CLEAR") ||
+            eqi(p, "CLEAR;") || eqi(p, ".CLEAR;") || eqi(p, "//CLEAR;")) {
+            stmt[0] = '\0';
+            cmd_clear();
+            continue;
         }
         if ((int)strlen(stmt) + (int)strlen(p) + 2 >= MAX_STATEMENT) {
             printf("ERR STATEMENT TOO LONG\n");

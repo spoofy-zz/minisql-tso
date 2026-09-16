@@ -119,8 +119,8 @@ outer joins or more than two tables.
 `.CLEAR`, `//CLEAR` or `CLEAR` clears the interactive display and writes a
 fresh `SQL> ` prompt immediately. On ANSI-capable local terminals, minisql
 uses the standard clear-screen and home-cursor escape sequence. Under the TSO
-line-mode wrapper, minisql refreshes the display with blank lines and then
-writes the prompt through `TPUT`.
+line-mode wrapper, minisql uses `STLINENO LINE=1,MODE=OFF` to reset the
+next output to the first screen line, then writes the prompt through `TPUT`.
 
 Files:
 
@@ -466,8 +466,9 @@ OK INDEX CREATED
 INDEX IDXCITY ON PEOPLE(CITY)
 FOREIGN KEY PERSON_ID REFERENCES PEOPLE(ID)
 ERR FOREIGN KEY NOT FOUND
-ID | NAME | CITY | AGE | EMAIL
-2 | IVO | RIJEKA | 41 | IVO@EX
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | RIJEKA | 41  | IVO@EX
 OK 1 ROWS
 ```
 
@@ -647,6 +648,8 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
   If this layout changes, recreate `IBMUSER.MINISQL.KV` with
   `jcl/ALLOCVS.jcl`.
 - `SELECT` supports `*`, a comma-separated column list, or `COUNT(*)`.
+- Result columns are left-aligned using the widest displayed value or header,
+  with ` | ` separators and a horizontal line below the header. This also applies to grouped results and joins.
 - `SELECT` supports optional `WHERE`, `GROUP BY`, `ORDER BY` and `LIMIT`
   clauses.
 - `SELECT * FROM a JOIN b ON a.col=b.col` supports one equality join.
