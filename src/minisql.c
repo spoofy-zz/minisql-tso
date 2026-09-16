@@ -8,9 +8,12 @@
 #endif
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
+#include "terminal3270.h"
 extern int msqtget(char *buf, int max) asm("MSQTGET");
 extern int msqtput(char *buf, int len) asm("MSQTPUT");
 extern int msqtclr(void) asm("MSQTCLR");
+extern int msqtline(int line) asm("MSQTLINE");
+extern int msqtscr(char *buf, int len) asm("MSQTSCR");
 #endif
 
 #define MAX_LINE 1024
@@ -133,6 +136,7 @@ static int g_tx_mode = TX_NONE;
 static int g_tx_seq = 0;
 static int g_interactive = 0;
 static int g_prompt_written = 0;
+static char g_last_statement[MAX_STATEMENT];
 
 #if defined(__MVS__) && defined(MINISQL_TSO)
 static char g_tso_out[MAX_LINE];
@@ -734,7 +738,7 @@ static int line_is_empty_input(const char *s)
 {
     while (*s != '\0') {
         unsigned char c = (unsigned char)*s;
-        if (isalnum(c) || strchr(".,/*<>=_'\"()-", c) != NULL) {
+        if (!isspace(c)) {
             return 0;
         }
         s++;
@@ -801,33 +805,11 @@ static int line_starts_command(const char *s)
            starts_i(s, "DROP TABLE") ||
            starts_i(s, "BEGIN") ||
            starts_i(s, "COMMIT") ||
-           starts_i(s, "ROLLBACK");
-}
-
-static void normalize_terminal_line(char *s, int max)
-{
-    int i;
-    int end;
-
-    for (i = 0; i < max; i++) {
-        if (line_starts_command(s + i)) {
-            if (i > 0) {
-                memmove(s, s + i, max - i);
-                memset(s + max - i, 0, i);
-            }
-            break;
-        }
-    }
-
-    s[max - 1] = '\0';
-    for (end = max - 2; end >= 0; end--) {
-        unsigned char c = (unsigned char)s[end];
-        if (c != '\0' && !isspace(c)) {
-            s[end + 1] = '\0';
-            return;
-        }
-        s[end] = '\0';
-    }
+           starts_i(s, "ROLLBACK") ||
+           starts_i(s, "REPEAT") ||
+           starts_i(s, ".REPEAT") ||
+           starts_i(s, "!!") ||
+           starts_i(s, "PF12");
 }
 
 static int ncmp_i(const char *a, const char *b, int n)
@@ -4179,6 +4161,7 @@ static void cmd_help(void)
     printf("  DROP TABLE name;\n");
     printf("  BEGIN; COMMIT; ROLLBACK;\n");
     printf("  .CLEAR or //CLEAR\n");
+    printf("  PF12, !! or .REPEAT  recall SQL for editing (TSO)\n");
     printf("  .TABLES\n");
     printf("  .SCHEMA name\n");
     printf("  DESC name or DESCRIBE name\n");
@@ -4309,13 +4292,17 @@ static void execute(char *sql)
 
 static int run_processor(int interactive)
 {
-    char line[MAX_LINE];
+    char line[MAX_STATEMENT + 32];
     char stmt[MAX_STATEMENT];
     char *p;
     int got_line;
+#if defined(__MVS__) && defined(MINISQL_TSO)
+    int recall_active = 0;
+#endif
 
     g_interactive = interactive;
     g_prompt_written = 0;
+    g_last_statement[0] = '\0';
     stmt[0] = '\0';
     if (interactive) {
         printf("MINISQL TSO READY\n");
@@ -4334,9 +4321,35 @@ static int run_processor(int interactive)
     while (1) {
 #if defined(__MVS__) && defined(MINISQL_TSO)
         if (interactive) {
+            unsigned char raw[MAX_STATEMENT + 32];
             memset(line, 0, sizeof(line));
-            got_line = msqtget(line, sizeof(line));
-            normalize_terminal_line(line, sizeof(line));
+            got_line = msqtget((char *)raw, sizeof(raw));
+            if (got_line > 0 && raw[0] == TERM_PF12) {
+                strcpy(line, ".REPEAT");
+            } else if (got_line > 0 && raw[0] == TERM_CLEAR) {
+                strcpy(line, ".CLEAR");
+                recall_active = 0;
+            } else if (got_line >= 3 && raw[0] == TERM_ENTER) {
+                got_line = term_input(line, sizeof(line), raw,
+                                      got_line, recall_active);
+                recall_active = 0;
+                if (got_line < 0) {
+                    /* A malformed screen response is not end of input. */
+                    msqtclr();
+                    printf("ERR INVALID TERMINAL INPUT; USE PF12 TO RECALL\n");
+                    write_prompt();
+                    continue;
+                }
+            } else if (got_line >= 0 && !recall_active) {
+                memcpy(line, raw, got_line);
+                line[got_line] = '\0';
+            } else if (got_line >= 0) {
+                /* Other PF keys must never execute the recalled SQL. */
+                unsigned char screen[MAX_STATEMENT + 64];
+                int size = term_recall_screen(screen, g_last_statement);
+                if (size >= 0) msqtscr((char *)screen, size);
+                continue;
+            }
         } else
 #endif
         {
@@ -4344,8 +4357,9 @@ static int run_processor(int interactive)
         }
         if (got_line < 0) {
             break;
+        } else {
+            p = trim(line);
         }
-        p = trim(line);
         if (line_is_empty_input(p)) {
             if (interactive) {
                 write_prompt();
@@ -4366,6 +4380,40 @@ static int run_processor(int interactive)
             cmd_clear();
             continue;
         }
+        /* Recall displays an input field; only returned input is executed. */
+        if (eqi(p, "!!") || eqi(p, "PF12") || eqi(p, "REPEAT") ||
+            eqi(p, ".REPEAT") || eqi(p, "REPEAT;") || eqi(p, ".REPEAT;")) {
+            if (g_last_statement[0] == '\0') {
+                printf("ERR NO LAST COMMAND\n");
+                if (interactive) {
+                    write_prompt();
+                }
+                continue;
+            }
+#if defined(__MVS__) && defined(MINISQL_TSO)
+            if (interactive) {
+                unsigned char screen[MAX_STATEMENT + 64];
+                int size = term_recall_screen(screen, g_last_statement);
+                if (size < 0) {
+                    printf("ERR COMMAND TOO LONG FOR RECALL SCREEN\n");
+                    write_prompt();
+                } else {
+                    fflush(stdout);
+                    if (msqtscr((char *)screen, size) == 0) {
+                        stmt[0] = '\0';
+                        recall_active = 1;
+                    } else {
+                        printf("ERR CANNOT OPEN RECALL SCREEN\n");
+                        write_prompt();
+                    }
+                }
+                continue;
+            }
+#endif
+            printf("SQL> %s\n", g_last_statement);
+            fflush(stdout);
+            continue;
+        }
         if ((int)strlen(stmt) + (int)strlen(p) + 2 >= MAX_STATEMENT) {
             printf("ERR STATEMENT TOO LONG\n");
             stmt[0] = '\0';
@@ -4381,6 +4429,20 @@ static int run_processor(int interactive)
         strcat(stmt, p);
         if (strchr(p, ';') != NULL || p[0] == '.') {
             g_prompt_written = 0;
+#if defined(__MVS__) && defined(MINISQL_TSO)
+            if (interactive) {
+                /* TSO line mode does not reliably track echoed input rows.
+                 * Always clear before executing an interactive statement so
+                 * its result cannot overlap the command text. */
+                if (msqtclr() != 0) {
+                    msqtput(" ", 1);
+                }
+            }
+#endif
+            if (p[0] != '.') {
+                strncpy(g_last_statement, stmt, MAX_STATEMENT - 1);
+                g_last_statement[MAX_STATEMENT - 1] = '\0';
+            }
             execute(stmt);
             stmt[0] = '\0';
             if (interactive && !g_prompt_written) {

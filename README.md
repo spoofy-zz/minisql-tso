@@ -545,6 +545,12 @@ Expected behavior:
 - changing a non-key column such as `CITY` works and rebuilds indexes.
 - `CLEAR`, `.CLEAR` or `//CLEAR` refreshes the interactive display and leaves a
   new `SQL> ` prompt ready for input.
+- In TSO, PF12, `!!`, `REPEAT` and `.REPEAT` recall the last SQL statement
+  into an editable 3270 input field after `SQL>`. The cursor is placed at
+  the end. Edit the text and press Enter to submit it; recall itself never
+  executes SQL. The recall screen supports up to 1913 characters, including
+  statements originally entered over multiple lines. Longer statements
+  report an error instead of being truncated.
 
 At the end, release the DD if you started `MSQLTSO` manually:
 

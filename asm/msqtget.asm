@@ -24,20 +24,13 @@ MSQTGET  CSECT
          TGET  (2),(3),ASIS,WAIT
          LTR   15,15
          BNZ   BAD
-*
-* Return strlen(buf), stopping at the first NUL left by the clear above.
-*
-         SR    15,15
-LENLOOP  LR    4,2
-         AR    4,15
-         CLI   0(4),X'00'
-         BE    DONE
-         LA    15,1(15)
-         CR    15,3
-         BL    LENLOOP
+* R1 is the actual byte count, including embedded NULs in 3270 data.
+         LR    15,1
          B     DONE
 BAD      L     15,=F'-1'
-DONE     LM    14,12,12(13)
+* Preserve the return value in R15 (LM 14,12 would overwrite it).
+DONE     L     14,12(13)
+         LM    0,12,20(13)
          BR    14
 *
          LTORG
