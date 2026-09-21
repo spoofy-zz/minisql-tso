@@ -33,8 +33,7 @@ if [ -n "${MINISQL_TOOLCHAIN_BIN:-}" ]; then
 	export PATH="${MINISQL_TOOLCHAIN_BIN}:${PATH}"
 fi
 
-MINISQL_PDS="${MINISQL_PDS:-${MVS_HLQ}.MINISQL}"
-MINISQL_LOADLIB="${MINISQL_LOADLIB:-${MINISQL_PDS}.LOAD}"
+MINISQL_LOADLIB="${MINISQL_LOADLIB:-${MVS_HLQ}.MINISQL.LOAD}"
 MINISQL_XMIT_IN="${MINISQL_XMIT_IN:-${MVS_HLQ}.MBT.XMIT.IN}"
 MINISQL_LOAD_VOLUME="${MINISQL_LOAD_VOLUME:-TSO003}"
 MINISQL_CMDPROC="${MINISQL_CMDPROC:-SYS2.CMDPROC}"
@@ -126,7 +125,6 @@ receive_loadlib() {
 echo "Deploy host: ${MVS_PROTOCOL}://${MVS_HOST}:${MVS_PORT} as ${MVS_USER}"
 echo "Loadlib:     ${MINISQL_LOADLIB}"
 echo "Staging:     ${MINISQL_XMIT_IN}"
-echo "Source PDS:  ${MINISQL_PDS}"
 echo "CLIST:       ${MINISQL_CMDPROC}(MSQL)"
 [ "$DRY_RUN" = "1" ] && echo "(dry run: no MVS changes)"
 
@@ -146,28 +144,6 @@ else
 	receive_loadlib
 fi
 
-upload_member src/minisql.c "$MINISQL_PDS" MINISQL
-upload_member src/msqltso.c "$MINISQL_PDS" MSQLTSO
-upload_member src/storage.c "$MINISQL_PDS" STORAGE
-upload_member src/parser.c "$MINISQL_PDS" PARSER
-upload_member src/catalog.c "$MINISQL_PDS" CATALOG
-upload_member src/rows.c "$MINISQL_PDS" ROWS
-upload_member src/select.c "$MINISQL_PDS" SELECT
-upload_member src/schema.c "$MINISQL_PDS" SCHEMA
-upload_member src/mutate.c "$MINISQL_PDS" MUTATE
-upload_member src/process.c "$MINISQL_PDS" PROCESS
-upload_member src/output.c "$MINISQL_PDS" OUTPUT
-upload_member include/minisql.h "$MINISQL_PDS" MSQLHDR
-upload_member include/terminal3270.h "$MINISQL_PDS" TERM3270
-upload_member asm/msqtget.asm "$MINISQL_PDS" MSQTGET
-upload_member asm/msqtput.asm "$MINISQL_PDS" MSQTPUT
-upload_member project.toml "$MINISQL_PDS" PROJTOML
-upload_member jcl/COMPILE.jcl "$MINISQL_PDS" COMPILE
-upload_member jcl/ALLOCVS.jcl "$MINISQL_PDS" ALLOCVS
-upload_member jcl/MINISQL.jcl "$MINISQL_PDS" RUNJCL
-upload_member jcl/MSQLTSO.jcl "$MINISQL_PDS" TSOJCL
-upload_member jcl/RECEIVE.jcl "$MINISQL_PDS" RECEIVE
-upload_member README.md "$MINISQL_PDS" README
 upload_member clist/MSQL.clist "$MINISQL_CMDPROC" MSQL
 
 echo "Deploy complete."

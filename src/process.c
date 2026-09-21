@@ -44,7 +44,13 @@ static void cmd_help(void)
     printf("  .SCHEMA name\n");
     printf("  DESC name or DESCRIBE name\n");
     printf("  .HELP or //HELP\n");
+    printf("  VERSION or .VERSION\n");
     printf("  .QUIT\n");
+}
+
+static void cmd_version(void)
+{
+    printf("%s %s (%s)\n", MBT_PROJECT, MBT_VERSION, MBT_COMMIT);
 }
 
 static void write_prompt(void)
@@ -90,6 +96,11 @@ static void execute(char *sql)
     }
     if (eqi(s, ".HELP") || eqi(s, "//HELP") || eqi(s, "HELP")) {
         cmd_help();
+        return;
+    }
+    if (eqi(s, "VERSION") || eqi(s, ".VERSION") ||
+        eqi(s, "//VERSION")) {
+        cmd_version();
         return;
     }
     if (eqi(s, ".CLEAR") || eqi(s, "//CLEAR") || eqi(s, "CLEAR")) {

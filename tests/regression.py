@@ -22,4 +22,7 @@ for name, sql in cases.items():
             fromfile=f'{name}.expected', tofile=f'{name}.actual'))
         raise SystemExit(1)
     assert not result.stderr, result.stderr
+version = subprocess.run([sys.argv[1]], input='VERSION;\n.QUIT\n',
+                         text=True, capture_output=True, check=True)
+assert 'minisql 0.1.0 (' in version.stdout, version.stdout
 print('Batch SQL, join and transaction regression snapshots passed')

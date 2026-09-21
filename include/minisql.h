@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <buildstamp.h>
 
 #define MAX_LINE 1024
 #define MAX_NAME 16

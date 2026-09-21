@@ -28,7 +28,7 @@ deploy-mvs-dry-run:
 	@tools/deploy-mvs.sh --dry-run
 
 HOST_CC ?= cc
-HOST_CFLAGS ?= -std=c99 -Wall -Wextra -O2
+HOST_CFLAGS ?= -std=c99 -Wall -Wextra -O2 -I.mbt
 HOST_ENGINE_SOURCES := $(filter-out src/minisql.c src/msqltso.c,$(wildcard src/*.c))
 
 .PHONY: check-host

@@ -183,6 +183,9 @@ snapshots captured before the module split. Host storage is in memory and
 lasts only for the current process. Set `HOST_CC` or `HOST_CFLAGS` to override
 the host compiler or its flags.
 
+`VERSION`, `.VERSION` and `//VERSION` print the project version and build
+commit, for example `minisql 0.1.0 (abc1234)`.
+
 Generate the XMIT deploy package:
 
 ```bash
@@ -216,7 +219,6 @@ MBT_MVS_HLQ=IBMUSER
 MBT_MVS_PROTOCOL=http
 MBT_MVS_REJECT_UNAUTHORIZED=false
 
-MINISQL_PDS=IBMUSER.MINISQL
 MINISQL_LOADLIB=IBMUSER.MINISQL.LOAD
 MINISQL_XMIT_IN=IBMUSER.MBT.XMIT.IN
 MINISQL_LOAD_VOLUME=TSO003
@@ -228,10 +230,10 @@ directory that contains `cc370`, `as370`, `ld370`, and `ar370`.
 If it is not set and `$(HOME)/.local/bin/cc370` exists, the Makefile uses
 `$(HOME)/.local/bin` automatically.
 
-`make deploy-mvs` reads `.env`, runs the mbt load module deploy to
-`MINISQL_LOADLIB` through `MINISQL_XMIT_IN`, uploads the project members to
-`MINISQL_PDS`, and uploads the TSO launcher CLIST to
-`MINISQL_CMDPROC(MSQL)`.
+`make deploy-mvs` reads `.env`, builds and deploys the load modules to
+`MINISQL_LOADLIB` through `MINISQL_XMIT_IN`, and uploads the TSO launcher CLIST
+to `MINISQL_CMDPROC(MSQL)`. C source and build JCL remain on Linux; the old
+`IBMUSER.MINISQL` source PDS is no longer used.
 
 Dry-run:
 
@@ -256,57 +258,7 @@ If a target uses HTTPS, set `MBT_MVS_PROTOCOL=https` and the HTTPS port in
 `.env`. The endpoint must expose z/OSMF-compatible REST paths under `/zosmf`;
 otherwise both mbt and Zowe commands will fail with HTTP 404.
 
-## Prepare The MVS PDS
-
-If the PDS does not exist yet, create it with Zowe:
-
-```bash
-zowe zos-files create data-set-partitioned IBMUSER.MINISQL \
-  --record-format FB \
-  --record-length 80 \
-  --block-size 3120 \
-  --directory-blocks 20 \
-  --primary-space 25 \
-  --secondary-space 10 \
-  --allocation-space-unit TRK \
-  --zosmf-profile hercules
-```
-
-`make deploy-mvs` uploads the source and JCL members automatically. If you
-need to do it manually, use commands like these with the target host/profile
-from your environment:
-
-```bash
-zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(MINISQL)" \
-  --zosmf-profile hercules < src/minisql.c
-
-zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(MSQLTSO)" \
-  --zosmf-profile hercules < src/msqltso.c
-
-zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(MSQTGET)" \
-  --zosmf-profile hercules < asm/msqtget.asm
-
-zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(MSQTPUT)" \
-  --zosmf-profile hercules < asm/msqtput.asm
-
-zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(COMPILE)" \
-  --zosmf-profile hercules < jcl/COMPILE.jcl
-
-zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(ALLOCVS)" \
-  --zosmf-profile hercules < jcl/ALLOCVS.jcl
-
-zowe zos-files upload stdin-to-data-set "IBMUSER.MINISQL(RUNJCL)" \
-  --zosmf-profile hercules < jcl/MINISQL.jcl
-```
-
-List PDS members:
-
-```bash
-zowe zos-files list all-members IBMUSER.MINISQL --zosmf-profile hercules
-```
-
-`make deploy-mvs` also uploads the TSO launcher CLIST automatically. Manual
-upload example:
+The TSO launcher CLIST can also be uploaded manually:
 
 ```bash
 zowe zos-files upload file-to-data-set clist/MSQL.clist \
