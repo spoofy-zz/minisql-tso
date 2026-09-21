@@ -1,2 +1,6 @@
-#define MINISQL_TSO 1
-#include "minisql.c"
+#include "minisql.h"
+
+int main(void)
+{
+    return run_processor(1);
+}

@@ -124,8 +124,17 @@ next output to the first screen line, then writes the prompt through `TPUT`.
 
 Files:
 
-- `src/minisql.c` - SQL parser, command execution, and VSAM key/value storage.
-- `src/msqltso.c` - TSO build wrapper for the same SQL engine.
+- `src/minisql.c`, `src/msqltso.c` - batch and interactive entry points.
+- `src/process.c` - statement input, command dispatch and terminal recall.
+- `src/output.c` - standard output and interactive MVS TPUT output.
+- `src/storage.c` - VSAM/host key-value storage and transaction journal.
+- `src/parser.c` - token parsing, data types and WHERE expressions.
+- `src/catalog.c` - table metadata serialization and catalog lookup.
+- `src/rows.c` - row sets, row persistence, indexes and foreign-key checks.
+- `src/schema.c` - table/index DDL and schema inspection commands.
+- `src/mutate.c` - INSERT, UPDATE and DELETE commands.
+- `src/select.c` - SELECT, joins, grouping, sorting and EXPLAIN.
+- `include/minisql.h` - shared engine types and internal module interfaces.
 - `asm/msqtget.asm` - C-callable TSO `TGET` wrapper for interactive input.
 - `asm/msqtput.asm` - C-callable TSO `TPUT` wrapper for normal TSO output.
 - `clist/MSQL.clist` - TSO CLIST that allocates `MINIKV`, starts `MSQLTSO`,
@@ -155,6 +164,24 @@ Expected load modules:
 build/MINISQL
 build/MSQLTSO
 ```
+
+Both entry points link the same separately compiled engine modules. The
+processor selects batch or interactive I/O at runtime; on MVS both load
+modules link the terminal wrappers, which are used only in interactive mode.
+The internal header supplies explicit MVS linker names where long C function
+names would otherwise collide after truncation to eight characters.
+
+Build and test locally with the host C compiler (no MVS connection needed):
+
+```bash
+make check-host
+```
+
+This builds `build/host/minisql` and `build/host/msqltso`, runs the SELECT
+formatting and 3270 tests, and compares batch SQL, join and transaction output with
+snapshots captured before the module split. Host storage is in memory and
+lasts only for the current process. Set `HOST_CC` or `HOST_CFLAGS` to override
+the host compiler or its flags.
 
 Generate the XMIT deploy package:
 

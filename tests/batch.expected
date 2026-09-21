@@ -1,0 +1,116 @@
+MINISQL MVS READY
+END STATEMENTS WITH ;  USE .QUIT TO EXIT
+OK TABLE CREATED
+PEOPLE(ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8), AGE INT, EMAIL VARCHAR(16))
+OK 1 ROW INSERTED
+OK 1 ROW INSERTED
+ERR BAD INT VALUE
+ERR VALUE TOO LONG
+OK INDEX CREATED
+PLAN INDEX LOOKUP IDXCITY ON PEOPLE(CITY)
+PLAN FILTER 1 CONDITION(S)
+PEOPLE(ID INT PRIMARY KEY, NAME VARCHAR(8), CITY CHAR(8), AGE INT, EMAIL VARCHAR(16))
+INDEX IDXCITY ON PEOPLE(CITY)
+FIELD | TYPE | KEY | REF
+ID | INT | PRI | 
+NAME | VARCHAR(8) |  | 
+CITY | CHAR(8) | MUL | 
+AGE | INT |  | 
+EMAIL | VARCHAR(16) |  | 
+OK 5 COLUMNS
+ERR TABLE NOT FOUND
+ERR TABLE NOT FOUND
+ERR TABLE NOT FOUND
+ERR TABLE NOT FOUND
+OK TRANSACTION BEGIN
+OK 1 ROW INSERTED
+OK TRANSACTION ROLLBACK
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | SPLIT  | 41  | IVO@EX
+1  | ANA  | ZAGREB | 30  | ANA@EX
+OK 2 ROWS
+COUNT
+-----
+2
+OK 1 ROWS
+NAME | CITY
+-----|-------
+IVO  | SPLIT
+ANA  | ZAGREB
+OK 2 ROWS
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+1  | ANA  | ZAGREB | 30  | ANA@EX
+OK 1 ROWS
+ID | NAME | CITY  | AGE | EMAIL
+---|------|-------|-----|-------
+2  | IVO  | SPLIT | 41  | IVO@EX
+OK 1 ROWS
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | SPLIT  | 41  | IVO@EX
+1  | ANA  | ZAGREB | 30  | ANA@EX
+OK 2 ROWS
+ID | NAME | CITY  | AGE | EMAIL
+---|------|-------|-----|-------
+2  | IVO  | SPLIT | 41  | IVO@EX
+OK 1 ROWS
+ID | NAME | CITY  | AGE | EMAIL
+---|------|-------|-----|-------
+2  | IVO  | SPLIT | 41  | IVO@EX
+OK 1 ROWS
+ID | NAME | CITY  | AGE | EMAIL
+---|------|-------|-----|-------
+2  | IVO  | SPLIT | 41  | IVO@EX
+OK 1 ROWS
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | SPLIT  | 41  | IVO@EX
+1  | ANA  | ZAGREB | 30  | ANA@EX
+OK 2 ROWS
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | SPLIT  | 41  | IVO@EX
+1  | ANA  | ZAGREB | 30  | ANA@EX
+OK 2 ROWS
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | SPLIT  | 41  | IVO@EX
+1  | ANA  | ZAGREB | 30  | ANA@EX
+OK 2 ROWS
+CITY   | COUNT
+-------|------
+SPLIT  | 1
+ZAGREB | 1
+OK 2 GROUPS
+CITY   | COUNT
+-------|------
+SPLIT  | 1
+ZAGREB | 1
+OK 2 GROUPS
+ERR TABLE NOT FOUND
+PLAN ERROR TABLE NOT FOUND
+ERR TABLE NOT FOUND
+ERR TABLE NOT FOUND
+ERR INDEX NOT FOUND
+OK 1 ROWS UPDATED
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | RIJEKA | 41  | IVO@EX
+1  | ANA  | ZAGREB | 30  | ANA@EX
+OK 2 ROWS
+OK 0 ROWS UPDATED
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | RIJEKA | 41  | IVO@EX
+OK 1 ROWS
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | RIJEKA | 41  | IVO@EX
+OK 1 ROWS
+OK 1 ROWS DELETED
+ID | NAME | CITY   | AGE | EMAIL
+---|------|--------|-----|-------
+2  | IVO  | RIJEKA | 41  | IVO@EX
+OK 1 ROWS

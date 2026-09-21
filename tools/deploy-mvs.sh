@@ -148,6 +148,16 @@ fi
 
 upload_member src/minisql.c "$MINISQL_PDS" MINISQL
 upload_member src/msqltso.c "$MINISQL_PDS" MSQLTSO
+upload_member src/storage.c "$MINISQL_PDS" STORAGE
+upload_member src/parser.c "$MINISQL_PDS" PARSER
+upload_member src/catalog.c "$MINISQL_PDS" CATALOG
+upload_member src/rows.c "$MINISQL_PDS" ROWS
+upload_member src/select.c "$MINISQL_PDS" SELECT
+upload_member src/schema.c "$MINISQL_PDS" SCHEMA
+upload_member src/mutate.c "$MINISQL_PDS" MUTATE
+upload_member src/process.c "$MINISQL_PDS" PROCESS
+upload_member src/output.c "$MINISQL_PDS" OUTPUT
+upload_member include/minisql.h "$MINISQL_PDS" MSQLHDR
 upload_member include/terminal3270.h "$MINISQL_PDS" TERM3270
 upload_member asm/msqtget.asm "$MINISQL_PDS" MSQTGET
 upload_member asm/msqtput.asm "$MINISQL_PDS" MSQTPUT

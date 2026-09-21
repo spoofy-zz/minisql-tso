@@ -2,3 +2,4 @@
 .mbt/
 build/
 minisql
+!tests/*.sql

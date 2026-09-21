@@ -9,12 +9,38 @@ cflags = ["-I", "include"]
 [[module]]
 name    = "MINISQL"
 startup = "crt0"
-sources = ["src/minisql.c"]
+sources = [
+    "src/minisql.c",
+    "src/storage.c",
+    "src/parser.c",
+    "src/catalog.c",
+    "src/rows.c",
+    "src/select.c",
+    "src/schema.c",
+    "src/mutate.c",
+    "src/process.c",
+    "src/output.c",
+    "asm/msqtget.asm",
+    "asm/msqtput.asm",
+]
 
 [[module]]
 name    = "MSQLTSO"
 startup = "crt0"
-sources = ["src/msqltso.c", "asm/msqtget.asm", "asm/msqtput.asm"]
+sources = [
+    "src/msqltso.c",
+    "src/storage.c",
+    "src/parser.c",
+    "src/catalog.c",
+    "src/rows.c",
+    "src/select.c",
+    "src/schema.c",
+    "src/mutate.c",
+    "src/process.c",
+    "src/output.c",
+    "asm/msqtget.asm",
+    "asm/msqtput.asm",
+]
 
 [deploy]
 target = "IBMUSER.MINISQL.LOAD"
