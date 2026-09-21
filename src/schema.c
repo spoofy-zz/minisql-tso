@@ -61,6 +61,13 @@ void cmd_desc(struct TableDef tables[], int count, char *sql)
     char *prefix;
     int idx;
     int c;
+    int field_width = 5;
+    int type_width = 4;
+    int key_width = 3;
+    int ref_width = 3;
+    char types[MAX_COLS][MAX_VALUE + 1];
+    char keys[MAX_COLS][MAX_VALUE + 1];
+    char refs[MAX_COLS][MAX_NAME * 2 + 4];
 
     prefix = starts_i(sql, ".DESCRIBE") ? ".DESCRIBE" : ".DESC";
     if (!parse_name_after(sql, prefix, name)) {
@@ -72,39 +79,61 @@ void cmd_desc(struct TableDef tables[], int count, char *sql)
         printf("ERR TABLE NOT FOUND\n");
         return;
     }
-    printf("FIELD | TYPE | KEY | REF\n");
     for (c = 0; c < tables[idx].col_count; c++) {
-        char typ[MAX_VALUE + 1];
-        char key[MAX_VALUE + 1];
-        char ref[MAX_NAME * 2 + 4];
         int i;
 
         type_to_text(tables[idx].col_types[c], tables[idx].col_lens[c],
-                     typ, sizeof(typ));
-        key[0] = '\0';
-        ref[0] = '\0';
+                     types[c], sizeof(types[c]));
+        keys[c][0] = '\0';
+        refs[c][0] = '\0';
         if (tables[idx].pk_col == c) {
-            strcat(key, "PRI");
+            strcat(keys[c], "PRI");
         }
         if (find_index_col(&tables[idx], c) >= 0) {
-            if (key[0] != '\0') {
-                strcat(key, ",");
+            if (keys[c][0] != '\0') {
+                strcat(keys[c], ",");
             }
-            strcat(key, "MUL");
+            strcat(keys[c], "MUL");
         }
         for (i = 0; i < tables[idx].fk_count; i++) {
             if (tables[idx].fk_cols[i] != c) {
                 continue;
             }
-            if (key[0] != '\0') {
-                strcat(key, ",");
+            if (keys[c][0] != '\0') {
+                strcat(keys[c], ",");
             }
-            strcat(key, "FK");
-            sprintf(ref, "%s(%s)", tables[idx].fk_tables[i],
+            strcat(keys[c], "FK");
+            sprintf(refs[c], "%s(%s)", tables[idx].fk_tables[i],
                     tables[idx].fk_ref_cols[i]);
             break;
         }
-        printf("%s | %s | %s | %s\n", tables[idx].cols[c], typ, key, ref);
+        if ((int)strlen(tables[idx].cols[c]) > field_width) {
+            field_width = (int)strlen(tables[idx].cols[c]);
+        }
+        if ((int)strlen(types[c]) > type_width) {
+            type_width = (int)strlen(types[c]);
+        }
+        if ((int)strlen(keys[c]) > key_width) {
+            key_width = (int)strlen(keys[c]);
+        }
+        if ((int)strlen(refs[c]) > ref_width) {
+            ref_width = (int)strlen(refs[c]);
+        }
+    }
+    printf("%-*s | %-*s | %-*s | %s\n", field_width, "FIELD",
+           type_width, "TYPE", key_width, "KEY", "REF");
+    for (c = 0; c < 4; c++) {
+        int width = c == 0 ? field_width :
+                    c == 1 ? type_width : c == 2 ? key_width : ref_width;
+        int i;
+        if (c > 0) printf("-|");
+        for (i = 0; i < width + (c > 0 ? 1 : 0); i++) printf("-");
+    }
+    printf("\n");
+    for (c = 0; c < tables[idx].col_count; c++) {
+        printf("%-*s | %-*s | %-*s | %s\n", field_width,
+               tables[idx].cols[c], type_width, types[c], key_width,
+               keys[c], refs[c]);
     }
     printf("OK %d COLUMNS\n", tables[idx].col_count);
 }
