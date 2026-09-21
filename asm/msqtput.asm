@@ -37,7 +37,7 @@ MSQTSCR  CSECT
          BR    14
 *
 * C-callable: int msqtclr(void)
-* Reset the next TPUT EDIT to line 1 and leave full-screen mode.
+* Erase the display, leave full-screen mode, and reset TPUT EDIT to line 1.
 * Inline expansion of SYS1.MACLIB STLINENO LINE=1,MODE=OFF on TK5.
 * STLINENO is not shipped in the local cross-assembler macro library.
 *
@@ -48,9 +48,15 @@ MSQTCLR  CSECT
          USING MSQTCLR,12
          LA    2,CLSCR
          LA    3,L'CLSCR
-         TPUT  (2),(3),FULLSCR,,HOLD
+         TPUT  (2),(3),FULLSCR,,NOHOLD
+         LR    10,15
          LTR   15,15
          BNZ   CLRFAIL
+         LA    1,1               Next output starts at screen line 1
+         LA    0,19              STLINENO terminal control function
+         SLL   0,24
+         SVC   94
+         LR    15,10             Return the TPUT result to C
          SR    15,15
 CLRFAIL  L     14,12(13)
          LM    0,12,20(13)

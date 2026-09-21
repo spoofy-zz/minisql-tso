@@ -4,6 +4,7 @@
 extern int msqtget(char *buf, int max) asm("MSQTGET");
 extern int msqtput(char *buf, int len) asm("MSQTPUT");
 extern int msqtclr(void) asm("MSQTCLR");
+extern int msqtline(int line) asm("MSQTLINE");
 extern int msqtscr(char *buf, int len) asm("MSQTSCR");
 #endif
 
@@ -327,7 +328,7 @@ int run_processor(int interactive)
                  * Always clear before executing an interactive statement so
                  * its result cannot overlap the command text. */
                 if (msqtclr() != 0) {
-                    msqtput(" ", 1);
+                    msqtline(1);
                 }
             }
 #endif

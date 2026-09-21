@@ -7,6 +7,7 @@ extern int msqtput(char *buf, int len) asm("MSQTPUT");
 /* Shared output routes to TPUT only in the interactive MVS processor. */
 #ifdef __MVS__
 extern int msqtclr(void) asm("MSQTCLR");
+extern int msqtline(int line) asm("MSQTLINE");
 static char g_tso_out[MAX_LINE];
 static int g_tso_out_len = 0;
 static int g_tso_lines = 0;
@@ -18,7 +19,11 @@ static void tso_flush_line(void)
          * every TSO terminal. Keep long SELECT results alive by starting a
          * fresh page before the next line would overflow it. */
         if (g_tso_lines >= 20) {
-            msqtclr();
+            if (msqtclr() != 0) {
+                /* Some terminals reject FULLSCR; recover line-mode output
+                 * with STLINENO instead of terminating the application. */
+                msqtline(1);
+            }
             g_tso_lines = 0;
         }
         g_tso_out[g_tso_out_len] = '\0';
