@@ -34,7 +34,7 @@ static int term_recall_screen(unsigned char *out, const char *sql)
     out[n++] = 0xc3; /* reset MDT, restore keyboard */
     out[n++] = 0x11; out[n++] = 0x40; out[n++] = 0x40;
     out[n++] = 0x3c; out[n++] = 0x40; out[n++] = 0x40;
-    out[n++] = 0x00; /* erase entire screen to NUL */
+    out[n++] = 0x40; /* erase entire screen with EBCDIC blanks */
     out[n++] = 0x11; out[n++] = term_code(1919 / 64);
     out[n++] = term_code(1919);
     out[n++] = 0x1d; out[n++] = 0x60; /* protected wrap field */

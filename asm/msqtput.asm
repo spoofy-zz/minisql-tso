@@ -55,7 +55,9 @@ MSQTCLR  CSECT
 CLRFAIL  L     14,12(13)
          LM    0,12,20(13)
          BR    14
-CLSCR    DC    X'C11140403C40400013'
+* Repeat an EBCDIC blank across the screen.  NUL is ignored by some
+* 3270 implementations, which leaves the old display contents intact.
+CLSCR    DC    X'C11140403C40404013'
 *
 * Full-screen erase clears the display and returns the cursor home.
          DROP  12
