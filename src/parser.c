@@ -82,18 +82,13 @@ int starts_i(const char *s, const char *prefix)
 int line_starts_command(const char *s)
 {
     return starts_i(s, ".QUIT") ||
-           starts_i(s, "//QUIT") ||
-           starts_i(s, "QUIT") ||
            starts_i(s, ".HELP") ||
-           starts_i(s, "//HELP") ||
-           starts_i(s, "HELP") ||
            starts_i(s, ".CLEAR") ||
-           starts_i(s, "//CLEAR") ||
-           starts_i(s, "CLEAR") ||
            starts_i(s, ".TABLES") ||
            starts_i(s, ".SCHEMA") ||
-           starts_i(s, "DESC") ||
-           starts_i(s, "DESCRIBE") ||
+           starts_i(s, ".DESC") ||
+           starts_i(s, ".DESCRIBE") ||
+           starts_i(s, ".VERSION") ||
            starts_i(s, "CREATE TABLE") ||
            starts_i(s, "CREATE INDEX") ||
            starts_i(s, "DROP INDEX") ||
@@ -106,10 +101,7 @@ int line_starts_command(const char *s)
            starts_i(s, "BEGIN") ||
            starts_i(s, "COMMIT") ||
            starts_i(s, "ROLLBACK") ||
-           starts_i(s, "REPEAT") ||
-           starts_i(s, ".REPEAT") ||
-           starts_i(s, "!!") ||
-           starts_i(s, "PF12");
+           starts_i(s, ".REPEAT");
 }
 
 int ncmp_i(const char *a, const char *b, int n)
@@ -668,4 +660,3 @@ int parse_where(struct TableDef *t, char *where_text,
     }
     return 1;
 }
-

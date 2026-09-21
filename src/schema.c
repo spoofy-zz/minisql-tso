@@ -62,9 +62,9 @@ void cmd_desc(struct TableDef tables[], int count, char *sql)
     int idx;
     int c;
 
-    prefix = starts_i(sql, "DESCRIBE") ? "DESCRIBE" : "DESC";
+    prefix = starts_i(sql, ".DESCRIBE") ? ".DESCRIBE" : ".DESC";
     if (!parse_name_after(sql, prefix, name)) {
-        printf("ERR USAGE: DESC table\n");
+        printf("ERR USAGE: .DESC table\n");
         return;
     }
     idx = find_table(tables, count, name);
@@ -553,4 +553,3 @@ void cmd_drop(struct TableDef tables[], int *count, char *sql)
     }
     printf("OK TABLE DROPPED\n");
 }
-

@@ -47,12 +47,15 @@ Utility commands:
 ```text
 .TABLES
 .SCHEMA PEOPLE
-DESC PEOPLE
+.DESC PEOPLE
+.DESCRIBE PEOPLE
 BEGIN
 COMMIT
 ROLLBACK
 .CLEAR
 .HELP
+.VERSION
+.REPEAT
 .QUIT
 ```
 
@@ -116,7 +119,7 @@ outer joins or more than two tables.
 
 ## Interactive Screen Clear
 
-`.CLEAR`, `//CLEAR` or `CLEAR` clears the interactive display and writes a
+`.CLEAR` clears the interactive display and writes a
 fresh `SQL> ` prompt immediately. On ANSI-capable local terminals, minisql
 uses the standard clear-screen and home-cursor escape sequence. Under the TSO
 line-mode wrapper, minisql uses `STLINENO LINE=1,MODE=OFF` to reset the
@@ -183,7 +186,7 @@ snapshots captured before the module split. Host storage is in memory and
 lasts only for the current process. Set `HOST_CC` or `HOST_CFLAGS` to override
 the host compiler or its flags.
 
-`VERSION`, `.VERSION` and `//VERSION` print the project version and build
+`.VERSION` prints the project version and build
 commit, for example `minisql 0.1.0 (abc1234)`.
 
 Generate the XMIT deploy package:
@@ -352,9 +355,8 @@ Important DD statements:
 - `SYSIN` contains SQL commands.
 - `SYSPRINT` contains program output.
 
-Each SQL command must end with `;`. Commands `.TABLES`, `.SCHEMA`, `.HELP`,
-and `.QUIT` may be entered without `;`. In a TSO session, `//HELP` and
-`//QUIT` are accepted as aliases for `.HELP` and `.QUIT`. Blank input lines
+Each SQL command must end with `;`. Dot commands such as `.TABLES`, `.SCHEMA`,
+`.HELP` and `.QUIT` may be entered without `;`. Blank input lines
 are ignored and are not appended to the current SQL statement buffer.
 
 ## Test From JCL
@@ -367,7 +369,7 @@ The standard batch test is `jcl/MINISQL.jcl`. The job:
 - creates secondary index `IDXCITY` on column `CITY`
 - tests `BEGIN` and `ROLLBACK`
 - prints `.SCHEMA PEOPLE`
-- tests `DESC PEOPLE` and `DESCRIBE ORDERS`
+- tests `.DESC PEOPLE` and `.DESCRIBE ORDERS`
 - tests `SELECT * FROM PEOPLE`
 - tests `SELECT COUNT(*) FROM PEOPLE`
 - tests selected-column output such as `SELECT NAME,CITY FROM PEOPLE`
@@ -481,7 +483,7 @@ Interactive test:
 ```sql
 .TABLES
 .SCHEMA PEOPLE
-DESC PEOPLE
+.DESC PEOPLE
 SELECT * FROM PEOPLE;
 SELECT COUNT(*) FROM PEOPLE;
 SELECT NAME,CITY FROM PEOPLE;
@@ -491,7 +493,7 @@ INSERT INTO PEOPLE VALUES ('ABC', 'PERO', 'RIJEKA', 22, 'PERO@EX');
 INSERT INTO PEOPLE VALUES (4, 'PREDUGOIME', 'RIJEKA', 22, 'LONG@EX');
 CREATE TABLE ORDERS (OID INT PRIMARY KEY, PERSON_ID INT,
 ITEM VARCHAR(8), FOREIGN KEY (PERSON_ID) REFERENCES PEOPLE(ID));
-DESCRIBE ORDERS
+.DESCRIBE ORDERS
 INSERT INTO ORDERS VALUES (100, 3, 'BOOK');
 INSERT INTO ORDERS VALUES (101, 99, 'BAD');
 SELECT * FROM PEOPLE WHERE ID > 1 AND CITY LIKE 'RI%';
@@ -500,7 +502,7 @@ SELECT * FROM PEOPLE WHERE NAME LIKE 'P%' OR CITY='SPLIT';
 SELECT * FROM PEOPLE ORDER BY AGE DESC;
 SELECT * FROM PEOPLE GROUP BY CITY ORDER BY COUNT DESC;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
-//CLEAR
+.CLEAR
 UPDATE PEOPLE SET CITY='SISAK' WHERE ID=3;
 SELECT * FROM PEOPLE WHERE CITY='RIJEKA';
 SELECT * FROM PEOPLE WHERE CITY='SISAK';
@@ -522,9 +524,9 @@ Expected behavior:
 - duplicate `ID=3` returns `ERR DUPLICATE PRIMARY KEY`.
 - changing a primary key column returns `ERR CANNOT UPDATE PRIMARY KEY`.
 - changing a non-key column such as `CITY` works and rebuilds indexes.
-- `CLEAR`, `.CLEAR` or `//CLEAR` refreshes the interactive display and leaves a
+- `.CLEAR` refreshes the interactive display and leaves a
   new `SQL> ` prompt ready for input.
-- In TSO, PF12, `!!`, `REPEAT` and `.REPEAT` recall the last SQL statement
+- In TSO, PF12 or `.REPEAT` recall the last SQL statement
   into an editable 3270 input field after `SQL>`. The cursor is placed at
   the end. Edit the text and press Enter to submit it; recall itself never
   executes SQL. The recall screen supports up to 1913 characters, including
@@ -652,7 +654,7 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - `BEGIN`, `COMMIT` and `ROLLBACK` are supported. Mutating statements outside
   an explicit transaction run in an implicit transaction. Startup recovery
   rolls back an active journal left by an interrupted run.
-- `DESC table` and `DESCRIBE table` show columns, data types, key roles and
+- `.DESC table` and `.DESCRIBE table` show columns, data types, key roles and
   foreign key references.
 - A secondary index is used for `SELECT * FROM table WHERE col=value` when an
   index exists on `col` and no `GROUP BY` or `ORDER BY` is used. Simple joins

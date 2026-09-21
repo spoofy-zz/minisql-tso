@@ -39,13 +39,14 @@ static void cmd_help(void)
     printf("  DELETE FROM name WHERE expression;\n");
     printf("  DROP TABLE name;\n");
     printf("  BEGIN; COMMIT; ROLLBACK;\n");
-    printf("  .CLEAR or //CLEAR\n");
-    printf("  PF12, !! or .REPEAT  recall SQL for editing (TSO)\n");
+    printf("  .CLEAR\n");
+    printf("  .REPEAT  recall SQL for editing (TSO; PF12 key)\n");
     printf("  .TABLES\n");
     printf("  .SCHEMA name\n");
-    printf("  DESC name or DESCRIBE name\n");
-    printf("  .HELP or //HELP\n");
-    printf("  VERSION or .VERSION\n");
+    printf("  .DESC name\n");
+    printf("  .DESCRIBE name\n");
+    printf("  .HELP\n");
+    printf("  .VERSION\n");
     printf("  .QUIT\n");
 }
 
@@ -95,16 +96,15 @@ static void execute(char *sql)
     if (*s == '\0') {
         return;
     }
-    if (eqi(s, ".HELP") || eqi(s, "//HELP") || eqi(s, "HELP")) {
+    if (eqi(s, ".HELP")) {
         cmd_help();
         return;
     }
-    if (eqi(s, "VERSION") || eqi(s, ".VERSION") ||
-        eqi(s, "//VERSION")) {
+    if (eqi(s, ".VERSION")) {
         cmd_version();
         return;
     }
-    if (eqi(s, ".CLEAR") || eqi(s, "//CLEAR") || eqi(s, "CLEAR")) {
+    if (eqi(s, ".CLEAR")) {
         cmd_clear();
         return;
     }
@@ -153,7 +153,7 @@ static void execute(char *sql)
         cmd_tables(tables, table_count);
     } else if (starts_i(s, ".SCHEMA")) {
         cmd_schema(tables, table_count, s);
-    } else if (starts_i(s, "DESC") || starts_i(s, "DESCRIBE")) {
+    } else if (starts_i(s, ".DESC") || starts_i(s, ".DESCRIBE")) {
         cmd_desc(tables, table_count, s);
     } else if (starts_i(s, "CREATE TABLE")) {
         cmd_create(tables, &table_count, s);
@@ -264,18 +264,16 @@ int run_processor(int interactive)
             write_prompt();
             continue;
         }
-        if (eqi(p, ".QUIT") || eqi(p, "//QUIT") || eqi(p, "QUIT")) {
+        if (eqi(p, ".QUIT")) {
             break;
         }
-        if (eqi(p, "CLEAR") || eqi(p, ".CLEAR") || eqi(p, "//CLEAR") ||
-            eqi(p, "CLEAR;") || eqi(p, ".CLEAR;") || eqi(p, "//CLEAR;")) {
+        if (eqi(p, ".CLEAR") || eqi(p, ".CLEAR;")) {
             stmt[0] = '\0';
             cmd_clear();
             continue;
         }
         /* Recall displays an input field; only returned input is executed. */
-        if (eqi(p, "!!") || eqi(p, "PF12") || eqi(p, "REPEAT") ||
-            eqi(p, ".REPEAT") || eqi(p, "REPEAT;") || eqi(p, ".REPEAT;")) {
+        if (eqi(p, ".REPEAT") || eqi(p, ".REPEAT;")) {
             if (g_last_statement[0] == '\0') {
                 printf("ERR NO LAST COMMAND\n");
                 if (interactive) {
