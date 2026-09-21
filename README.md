@@ -322,6 +322,18 @@ zowe zos-jobs submit local-file jcl/ALLOCVS.jcl \
 Run this job when you want to reset the database. Do not submit `ALLOCVS.jcl`
 again if you want to keep existing data.
 
+To create a larger sample database, submit `jcl/SEED20.jcl` after the VSAM
+cluster exists:
+
+```bash
+zowe zos-jobs submit local-file jcl/SEED20.jcl \
+  --wait-for-output \
+  --zosmf-profile hercules
+```
+
+The batch replaces `PEOPLE` and `ORDERS`, inserts 20 people and 60 orders
+(three orders per person), and prints count and full-table checks.
+
 ## Use From JCL
 
 The batch program is started as `PGM=MINISQL`:
