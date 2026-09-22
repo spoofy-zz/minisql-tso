@@ -29,7 +29,8 @@ static void cmd_help(void)
     printf("  CREATE INDEX idx ON name (col);\n");
     printf("  DROP INDEX idx;\n");
     printf("  INSERT INTO name VALUES (v1, v2, ...);\n");
-    printf("  SELECT *|cols|COUNT(*) FROM name (optional WHERE expression)\n");
+    printf("  SELECT *|cols|COUNT(*)|SUM(col)|AVG(col)|MIN(col)|MAX(col)\n");
+    printf("    FROM name (optional WHERE expression)\n");
     printf("    (optional GROUP BY col, ORDER BY col|COUNT, LIMIT n);\n");
     printf("  SELECT * FROM a JOIN b ON a.col=b.col;\n");
     printf("  EXPLAIN SELECT ...;\n");

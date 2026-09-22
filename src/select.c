@@ -9,20 +9,27 @@ struct JoinProj {
 struct GroupRow {
     char value[MAX_VALUE + 1];
     int count;
+    long sum;
+    char min_value[MAX_VALUE + 1];
+    char max_value[MAX_VALUE + 1];
 };
+
+enum AggregateKind { AGG_NONE, AGG_COUNT, AGG_SUM, AGG_AVG, AGG_MIN, AGG_MAX };
 
 
 static void measure_cell(int *width, const char *value);
 static void print_cell(const char *value, int width, int last);
 static void print_header_rule(int widths[], int col_count);
-static int is_count_expr(const char *s);
+static int parse_aggregate_expr(struct TableDef *t, const char *s,
+                                int *kind, int *col);
 static char *find_keyword(char *s, const char *keyword);
 static void print_projected_line(struct TableDef *t, struct Row *row,
                                  int cols[], int col_count, int header,
                                  int widths[]);
 static int parse_select_list(struct TableDef *t, char *text, int cols[],
                              int *col_count, int *select_all,
-                             int *select_count);
+                             int *select_count, int *aggregate_kind,
+                             int *aggregate_col);
 static int cmp_row_qsort(const void *a, const void *b);
 static int cmp_group_qsort(const void *a, const void *b);
 static char *next_select_clause(char *where, char *group, char *order,
@@ -33,7 +40,9 @@ static int parse_order_clause(struct TableDef *t, char *text, int group_col,
                               int *order_col, int *order_count, int *desc);
 static int parse_limit_clause(char *text, int *limit);
 static int add_group_row(struct GroupRow groups[], int group_cap,
-                         int *group_count, const char *value);
+                         int *group_count, const char *value,
+                         struct TableDef *t, struct Row *row,
+                         int aggregate_col);
 static int parse_qualified_col(char *text, char *table, char *col);
 static int name_matches(const char *token, const char *table,
                         const char *alias);
@@ -92,9 +101,36 @@ static void print_header_rule(int widths[], int col_count)
     printf("\n");
 }
 
-static int is_count_expr(const char *s)
+static int parse_aggregate_expr(struct TableDef *t, const char *s,
+                                int *kind, int *col)
 {
-    return eqi(s, "COUNT") || eqi(s, "COUNT()") || eqi(s, "COUNT(*)");
+    char buf[MAX_VALUE + 1];
+    char *open;
+    char *close;
+    char *arg;
+
+    strncpy(buf, s, MAX_VALUE);
+    buf[MAX_VALUE] = '\0';
+    clean_token(buf);
+    *kind = AGG_NONE;
+    *col = -1;
+    open = strchr(buf, '(');
+    if (open == NULL) return 0;
+    *open = '\0';
+    close = strrchr(open + 1, ')');
+    if (close == NULL || close[1] != '\0') return -1;
+    *close = '\0';
+    if (eqi(buf, "COUNT")) *kind = AGG_COUNT;
+    else if (eqi(buf, "SUM")) *kind = AGG_SUM;
+    else if (eqi(buf, "AVG")) *kind = AGG_AVG;
+    else if (eqi(buf, "MIN")) *kind = AGG_MIN;
+    else if (eqi(buf, "MAX")) *kind = AGG_MAX;
+    else return 0;
+    arg = trim(open + 1);
+    if (*kind == AGG_COUNT && (eqi(arg, "") || eqi(arg, "*"))) return 1;
+    if (*kind == AGG_COUNT) return -1;
+    *col = find_col(t, arg);
+    return *col >= 0 ? 1 : -1;
 }
 
 static char *find_keyword(char *s, const char *keyword)
@@ -134,7 +170,8 @@ static void print_projected_line(struct TableDef *t, struct Row *row,
 
 static int parse_select_list(struct TableDef *t, char *text, int cols[],
                              int *col_count, int *select_all,
-                             int *select_count)
+                             int *select_count, int *aggregate_kind,
+                             int *aggregate_col)
 {
     char vals[MAX_COLS][MAX_VALUE + 1];
     int val_count = 0;
@@ -143,12 +180,14 @@ static int parse_select_list(struct TableDef *t, char *text, int cols[],
     *col_count = 0;
     *select_all = 0;
     *select_count = 0;
+    *aggregate_kind = AGG_NONE;
+    *aggregate_col = -1;
     clean_token_max(text, MAX_STATEMENT);
     if (eqi(text, "*")) {
         *select_all = 1;
         return 1;
     }
-    if (is_count_expr(text)) {
+    if (parse_aggregate_expr(t, text, aggregate_kind, aggregate_col) > 0) {
         *select_count = 1;
         return 1;
     }
@@ -159,9 +198,17 @@ static int parse_select_list(struct TableDef *t, char *text, int cols[],
     for (i = 0; i < val_count; i++) {
         int c;
 
-        if (is_count_expr(vals[i])) {
-            *select_count = 1;
-            continue;
+        {
+            int kind;
+            int col;
+            int aggregate = parse_aggregate_expr(t, vals[i], &kind, &col);
+            if (aggregate < 0 || (aggregate > 0 && *select_count)) return 0;
+            if (aggregate > 0) {
+                *select_count = 1;
+                *aggregate_kind = kind;
+                *aggregate_col = col;
+                continue;
+            }
         }
         c = find_col(t, vals[i]);
         if (c < 0) {
@@ -309,13 +356,25 @@ static int parse_limit_clause(char *text, int *limit)
 }
 
 static int add_group_row(struct GroupRow groups[], int group_cap,
-                         int *group_count, const char *value)
+                         int *group_count, const char *value,
+                         struct TableDef *t, struct Row *row,
+                         int aggregate_col)
 {
     int i;
 
     for (i = 0; i < *group_count; i++) {
         if (eqi(groups[i].value, value)) {
             groups[i].count++;
+            if (aggregate_col >= 0) {
+                long number = atol(row->values[aggregate_col]);
+                groups[i].sum += number;
+                if (cmp_value(t, aggregate_col, row->values[aggregate_col],
+                              groups[i].min_value) < 0)
+                    strcpy(groups[i].min_value, row->values[aggregate_col]);
+                if (cmp_value(t, aggregate_col, row->values[aggregate_col],
+                              groups[i].max_value) > 0)
+                    strcpy(groups[i].max_value, row->values[aggregate_col]);
+            }
             return 1;
         }
     }
@@ -325,6 +384,15 @@ static int add_group_row(struct GroupRow groups[], int group_cap,
     strncpy(groups[*group_count].value, value, MAX_VALUE);
     groups[*group_count].value[MAX_VALUE] = '\0';
     groups[*group_count].count = 1;
+    groups[*group_count].sum = aggregate_col >= 0 ?
+                               atol(row->values[aggregate_col]) : 0;
+    if (aggregate_col >= 0) {
+        strcpy(groups[*group_count].min_value, row->values[aggregate_col]);
+        strcpy(groups[*group_count].max_value, row->values[aggregate_col]);
+    } else {
+        groups[*group_count].min_value[0] = '\0';
+        groups[*group_count].max_value[0] = '\0';
+    }
     (*group_count)++;
     return 1;
 }
@@ -777,6 +845,8 @@ void cmd_select(struct TableDef tables[], int count, char *sql)
     int select_col_count = 0;
     int select_all = 0;
     int select_count = 0;
+    int aggregate_kind = AGG_NONE;
+    int aggregate_col = -1;
     int where_col;
     int index_no;
     char where_val[MAX_VALUE + 1];
@@ -835,8 +905,14 @@ void cmd_select(struct TableDef tables[], int count, char *sql)
         return;
     }
     if (!parse_select_list(&tables[idx], select_buf, select_cols,
-                           &select_col_count, &select_all, &select_count)) {
+                           &select_col_count, &select_all, &select_count,
+                           &aggregate_kind, &aggregate_col)) {
         printf("ERR BAD SELECT LIST\n");
+        return;
+    }
+    if ((aggregate_kind == AGG_SUM || aggregate_kind == AGG_AVG) &&
+        tables[idx].col_types[aggregate_col] != TYPE_INT) {
+        printf("ERR AGGREGATE REQUIRES INT\n");
         return;
     }
     p = ltrim(p);
@@ -1032,7 +1108,8 @@ void cmd_select(struct TableDef tables[], int count, char *sql)
         }
         for (r = 0; r < out.count; r++) {
             if (!add_group_row(groups, out.count, &group_count,
-                               out.rows[r].values[group_col])) {
+                               out.rows[r].values[group_col], &tables[idx],
+                               &out.rows[r], aggregate_col)) {
                 free(groups);
                 rowset_free(&out);
                 printf("ERR TOO MANY GROUPS\n");
@@ -1050,29 +1127,70 @@ void cmd_select(struct TableDef tables[], int count, char *sql)
         group_width = (int)strlen(tables[idx].cols[group_col]);
         for (r = 0; r < group_count &&
              (limit_count < 0 || r < limit_count); r++) {
+            char aggregate_text[64];
             measure_cell(&group_width, groups[r].value);
-            sprintf(count_text, "%d", groups[r].count);
-            measure_cell(&count_width, count_text);
+            if (aggregate_kind == AGG_NONE || aggregate_kind == AGG_COUNT) {
+                sprintf(aggregate_text, "%d", groups[r].count);
+            } else if (aggregate_kind == AGG_SUM) {
+                sprintf(aggregate_text, "%ld", groups[r].sum);
+            } else if (aggregate_kind == AGG_AVG) {
+                sprintf(aggregate_text, "%.2f",
+                        (double)groups[r].sum / groups[r].count);
+            } else if (aggregate_kind == AGG_MIN) {
+                strcpy(aggregate_text, groups[r].min_value);
+            } else {
+                strcpy(aggregate_text, groups[r].max_value);
+            }
+            measure_cell(&count_width, aggregate_text);
+        }
+        {
+            char aggregate_name[MAX_NAME + 8];
+            const char *label = "COUNT";
+            if (aggregate_kind == AGG_SUM) label = "SUM";
+            else if (aggregate_kind == AGG_AVG) label = "AVG";
+            else if (aggregate_kind == AGG_MIN) label = "MIN";
+            else if (aggregate_kind == AGG_MAX) label = "MAX";
+            if (aggregate_kind != AGG_COUNT && aggregate_col >= 0) {
+                sprintf(aggregate_name, "%s(%s)", label,
+                        tables[idx].cols[aggregate_col]);
+                label = aggregate_name;
+            }
+            if (select_all || (select_col_count > 0 && select_count)) {
+                printf("%-*s | %s\n", group_width,
+                       tables[idx].cols[group_col], label);
+            } else if (select_count) {
+                printf("%s\n", label);
+            } else {
+                printf("%s\n", tables[idx].cols[group_col]);
+            }
         }
         if (select_all || (select_col_count > 0 && select_count)) {
-            printf("%-*s | COUNT\n", group_width, tables[idx].cols[group_col]);
             widths[0] = group_width;
             widths[1] = count_width;
             print_header_rule(widths, 2);
         } else if (select_count) {
-            printf("COUNT\n");
             print_header_rule(&count_width, 1);
         } else {
-            printf("%s\n", tables[idx].cols[group_col]);
             print_header_rule(&group_width, 1);
         }
         for (r = 0; r < group_count &&
              (limit_count < 0 || r < limit_count); r++) {
+            char value[64];
+            if (aggregate_kind == AGG_NONE || aggregate_kind == AGG_COUNT) {
+                sprintf(value, "%d", groups[r].count);
+            } else if (aggregate_kind == AGG_SUM) {
+                sprintf(value, "%ld", groups[r].sum);
+            } else if (aggregate_kind == AGG_AVG) {
+                sprintf(value, "%.2f", (double)groups[r].sum / groups[r].count);
+            } else if (aggregate_kind == AGG_MIN) {
+                strcpy(value, groups[r].min_value);
+            } else {
+                strcpy(value, groups[r].max_value);
+            }
             if (select_all || (select_col_count > 0 && select_count)) {
-                printf("%-*s | %d\n", group_width, groups[r].value,
-                       groups[r].count);
+                printf("%-*s | %s\n", group_width, groups[r].value, value);
             } else if (select_count) {
-                printf("%d\n", groups[r].count);
+                printf("%s\n", value);
             } else {
                 printf("%s\n", groups[r].value);
             }
@@ -1090,12 +1208,51 @@ void cmd_select(struct TableDef tables[], int count, char *sql)
             printf("ERR BAD SELECT LIST\n");
             return;
         }
-        count_width = 5;
-        sprintf(count_text, "%d", out.count);
-        measure_cell(&count_width, count_text);
-        printf("COUNT\n");
-        print_header_rule(&count_width, 1);
-        printf("%d\n", out.count);
+        {
+            char value[64];
+            const char *label = "COUNT";
+            long sum = 0;
+            int min_row = -1;
+            int max_row = -1;
+            if (aggregate_kind == AGG_SUM) label = "SUM";
+            else if (aggregate_kind == AGG_AVG) label = "AVG";
+            else if (aggregate_kind == AGG_MIN) label = "MIN";
+            else if (aggregate_kind == AGG_MAX) label = "MAX";
+            if (aggregate_kind == AGG_COUNT) {
+                sprintf(value, "%d", out.count);
+            } else {
+                for (r = 0; r < out.count; r++) {
+                    if (aggregate_kind == AGG_SUM || aggregate_kind == AGG_AVG)
+                        sum += atol(out.rows[r].values[aggregate_col]);
+                    if (min_row < 0 || cmp_value(&tables[idx], aggregate_col,
+                            out.rows[r].values[aggregate_col],
+                            out.rows[min_row].values[aggregate_col]) < 0)
+                        min_row = r;
+                    if (max_row < 0 || cmp_value(&tables[idx], aggregate_col,
+                            out.rows[r].values[aggregate_col],
+                            out.rows[max_row].values[aggregate_col]) > 0)
+                        max_row = r;
+                }
+                if (aggregate_kind == AGG_SUM) sprintf(value, "%ld", sum);
+                else if (aggregate_kind == AGG_AVG)
+                    sprintf(value, "%.2f", out.count ? (double)sum / out.count : 0.0);
+                else if (aggregate_kind == AGG_MIN)
+                    strcpy(value, out.count ? out.rows[min_row].values[aggregate_col] : "");
+                else
+                    strcpy(value, out.count ? out.rows[max_row].values[aggregate_col] : "");
+            }
+            if (aggregate_kind == AGG_COUNT) {
+                strcpy(count_text, "COUNT");
+            } else {
+                sprintf(count_text, "%s(%s)", label,
+                        tables[idx].cols[aggregate_col]);
+            }
+            count_width = (int)strlen(count_text);
+            measure_cell(&count_width, value);
+            printf("%s\n", count_text);
+            print_header_rule(&count_width, 1);
+            printf("%s\n", value);
+        }
         printf("OK 1 ROWS\n");
         rowset_free(&out);
         return;
@@ -1335,4 +1492,3 @@ void cmd_explain(struct TableDef tables[], int count, char *sql)
         printf("PLAN LIMIT\n");
     }
 }
-

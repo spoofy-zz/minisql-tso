@@ -18,6 +18,10 @@ AGE INT, EMAIL VARCHAR(16));
 INSERT INTO PEOPLE VALUES (1, 'ANA', 'ZAGREB', 30, 'ANA@EX');
 SELECT * FROM PEOPLE;
 SELECT COUNT(*) FROM PEOPLE;
+SELECT SUM(AGE) FROM PEOPLE;
+SELECT AVG(AGE) FROM PEOPLE;
+SELECT MIN(AGE) FROM PEOPLE;
+SELECT MAX(AGE) FROM PEOPLE;
 SELECT NAME, CITY FROM PEOPLE;
 CREATE INDEX IDXCITY ON PEOPLE (CITY);
 SELECT * FROM PEOPLE WHERE CITY='ZAGREB';
@@ -646,7 +650,9 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - VSAM record layout is fixed: 64-byte key, 960-byte data, 1024 bytes total.
   If this layout changes, recreate `IBMUSER.MINISQL.KV` with
   `jcl/ALLOCVS.jcl`.
-- `SELECT` supports `*`, a comma-separated column list, or `COUNT(*)`.
+- `SELECT` supports `*`, a comma-separated column list, and aggregate
+  functions `COUNT(*)`, `SUM(column)`, `AVG(column)`, `MIN(column)` and
+  `MAX(column)`.
 - Result columns are left-aligned using the widest displayed value or header,
   with ` | ` separators and a horizontal line below the header. This also applies to grouped results and joins.
 - `SELECT` supports optional `WHERE`, `GROUP BY`, `ORDER BY` and `LIMIT`
@@ -659,10 +665,11 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - `AND` has higher precedence than `OR`, as in SQL.
 - `ORDER BY` supports one table column with optional `ASC` or `DESC`.
 - `LIMIT n` limits row or group output for `SELECT`.
-- `GROUP BY` supports one table column and returns that column plus `COUNT`.
+- `GROUP BY` supports one table column and returns that column plus the
+  selected aggregate. `SUM` and `AVG` require an `INT` column.
 - Grouped `ORDER BY` supports the grouped column or `COUNT`.
-- `COUNT(*)` supports an optional `WHERE`; with `GROUP BY`, it counts each
-  group.
+- Aggregate functions support an optional `WHERE`; with `GROUP BY`, they are
+  calculated independently for each group.
 - `BEGIN`, `COMMIT` and `ROLLBACK` are supported. Mutating statements outside
   an explicit transaction run in an implicit transaction. Startup recovery
   rolls back an active journal left by an interrupted run.
@@ -675,7 +682,7 @@ zowe zos-jobs view spool-file-by-id JOBID DDID --zosmf-profile hercules
 - `UPDATE` supports one `SET col=value` and an optional `WHERE` expression.
 - `DELETE` supports an optional `WHERE` expression; without `WHERE`, it deletes
   all rows in the table.
-- There are no outer joins, multi-table planners, general aggregate functions,
-  views, stored procedures, triggers, page-level B-trees or WAL mode.
+- There are no outer joins, multi-table planners, views, stored procedures,
+  triggers, page-level B-trees or WAL mode.
 - `MSQLTSO` is an interactive foreground TSO program. Use `MINISQL`, not
   `MSQLTSO`, for batch SQL.

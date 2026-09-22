@@ -64,4 +64,25 @@ for query, header, count in [
     rule = output[start + 1]
     assert set(rule) == {'-'}, (query, output)
     assert len(rule) == max(map(len, [header] + output[start + 2:start + 2 + count]))
-print('22 SELECT alignment and header rule checks passed')
+aggregate_setup = """
+CREATE TABLE METRICS (ID INT PRIMARY KEY, CITY VARCHAR(8), VALUE INT);
+INSERT INTO METRICS VALUES (1, 'A', 10);
+INSERT INTO METRICS VALUES (2, 'A', 20);
+INSERT INTO METRICS VALUES (3, 'B', 30);
+"""
+for query, header, value in [
+    ('SELECT SUM(VALUE) FROM METRICS;', 'SUM(VALUE)', '60'),
+    ('SELECT AVG(VALUE) FROM METRICS;', 'AVG(VALUE)', '20.00'),
+    ('SELECT MIN(VALUE) FROM METRICS;', 'MIN(VALUE)', '10'),
+    ('SELECT MAX(VALUE) FROM METRICS;', 'MAX(VALUE)', '30'),
+    ('SELECT CITY,SUM(VALUE) FROM METRICS GROUP BY CITY;', 'SUM(VALUE)', '30'),
+]:
+    result = subprocess.run([sys.argv[1]], input=aggregate_setup + query + '\n.QUIT\n',
+                            text=True, capture_output=True, check=True)
+    assert 'ERR ' not in result.stdout, result.stdout
+    assert header in result.stdout, result.stdout
+    if 'GROUP BY' in query:
+        assert f'| {value}' in result.stdout, result.stdout
+    else:
+        assert f'\n{value}\n' in result.stdout, result.stdout
+print('27 SELECT alignment and aggregate checks passed')
